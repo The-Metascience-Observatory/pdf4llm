@@ -25,6 +25,7 @@ from .models import (
 from .extractors.grobid import extract_with_grobid, GrobidError, GrobidClient
 from .extractors.fast import extract_fast, _extract_doi_from_filename
 from .extractors.tables import assess_table_quality
+from .extractors.ocr_fallback import needs_ocr_fallback, extract_with_ocr
 from .renderers.markdown import render_markdown, render_abstract_md, render_body_md, render_tables_md
 from .renderers.json_output import render_json, render_references_json
 from .validation import validate_document
@@ -199,6 +200,27 @@ def convert_single(
         document.metadata.quality_issues = quality_issues
         if quality_issues:
             logger.info(f"Quality score {quality_score:.2f} for {pdf_path.name}: {', '.join(quality_issues)}")
+        
+        # OCR fallback: if quality is below threshold, retry with OCR
+        if needs_ocr_fallback(quality_score):
+            logger.info(f"Quality score {quality_score:.2f} below threshold, attempting OCR fallback...")
+            try:
+                ocr_document = extract_with_ocr(pdf_path, config)
+                ocr_score, ocr_issues = validate_document(ocr_document)
+                
+                # Use OCR result if it's better than GROBID result
+                if ocr_score > quality_score:
+                    logger.info(f"OCR fallback improved quality: {quality_score:.2f} -> {ocr_score:.2f}")
+                    document = ocr_document
+                    document.metadata.quality_score = ocr_score
+                    document.metadata.quality_issues = ocr_issues
+                    warnings.append(f"OCR fallback used (quality improved from {quality_score:.2f} to {ocr_score:.2f})")
+                else:
+                    logger.info(f"OCR fallback did not improve quality ({ocr_score:.2f} vs {quality_score:.2f}), keeping original")
+                    warnings.append(f"OCR fallback attempted but did not improve quality")
+            except Exception as e:
+                logger.warning(f"OCR fallback failed: {e}")
+                warnings.append(f"OCR fallback failed: {e}")
 
     # Render outputs if we have a document
     result_output_dir = None
