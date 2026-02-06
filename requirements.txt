@@ -1,0 +1,15 @@
+# PDF-to-Markdown Pipeline for LLM Analysis
+# Requirements
+
+# Core
+requests>=2.31.0
+lxml>=4.9.0
+pydantic>=2.0.0
+
+# PDF extraction
+pymupdf>=1.23.0
+pdfplumber>=0.10.0
+
+# Utilities
+tqdm>=4.66.0
+click>=8.0.0

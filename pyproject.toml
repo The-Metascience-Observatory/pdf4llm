@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pdf2mdjson"
+version = "1.0.0"
+description = "PDF-to-Markdown and JSON converter optimized for LLM analysis of scientific papers"
+requires-python = ">=3.9"
+dependencies = [
+    "requests>=2.31.0",
+    "lxml>=4.9.0",
+    "pydantic>=2.0.0",
+    "pymupdf>=1.23.0",
+    "pdfplumber>=0.10.0",
+    "tqdm>=4.66.0",
+    "click>=8.0.0",
+    "Pillow>=10.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "black>=23.0.0",
+    "isort>=5.12.0",
+]
+
+[project.scripts]
+pdf2mdjson = "pdf2mdjson.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["pdf2mdjson*"]

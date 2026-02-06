@@ -1,0 +1,68 @@
+# GROBID configuration with CRF models only (fastest CPU performance)
+# Use this for maximum speed when DeLFT accuracy gains are not needed
+
+server:
+  applicationConnectors:
+    - type: http
+      port: 8070
+  adminConnectors:
+    - type: http
+      port: 8071
+  requestLog:
+    appenders:
+      - type: console
+
+grobid:
+  # GROBID home directory
+  grobidHome: "grobid-home"
+  temp: "tmp"
+  nativelibrary: "lib"
+
+  pdf:
+    pdfalto:
+      path: "pdfalto"
+      memoryLimitMb: 6096
+      timeoutSec: 120
+    blocksMax: 200000
+    tokensMax: 1000000
+
+  consolidation:
+    service: "crossref"
+    crossref:
+      mailto:
+      token:
+
+  # Higher concurrency for CRF (no DL overhead)
+  concurrency: 10
+
+  # Maximum time to wait for model loading (in seconds)
+  poolMaxWait: 60
+
+  # All models use Wapiti (CRF) engine for maximum speed
+  models:
+    - name: "citation"
+      engine: "wapiti"
+
+    - name: "affiliation-address"
+      engine: "wapiti"
+
+    - name: "reference-segmenter"
+      engine: "wapiti"
+
+    - name: "header"
+      engine: "wapiti"
+
+    - name: "funding-acknowledgement"
+      engine: "wapiti"
+
+    - name: "segmentation"
+      engine: "wapiti"
+
+    - name: "name-citation"
+      engine: "wapiti"
+
+    - name: "name-header"
+      engine: "wapiti"
+
+    - name: "date"
+      engine: "wapiti"

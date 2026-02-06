@@ -1,0 +1,98 @@
+# GROBID configuration with selective DeLFT models for CPU
+# Optimized for highest accuracy while managing CPU performance
+
+server:
+  applicationConnectors:
+    - type: http
+      port: 8070
+  adminConnectors:
+    - type: http
+      port: 8071
+  requestLog:
+    appenders:
+      - type: console
+
+grobid:
+  # GROBID home directory
+  grobidHome: "grobid-home"
+  temp: "tmp"
+  nativelibrary: "lib"
+
+  pdf:
+    pdfalto:
+      path: "pdfalto"
+      memoryLimitMb: 6096
+      timeoutSec: 120
+    blocksMax: 200000
+    tokensMax: 1000000
+
+  consolidation:
+    service: "crossref"
+    crossref:
+      mailto:
+      token:
+
+  # Concurrency tuned for CPU with DL models (reduce from default 10)
+  concurrency: 4
+
+  # Maximum time to wait for model loading (in seconds)
+  poolMaxWait: 60
+
+  # DeLFT configuration (paths inside Docker container)
+  delft:
+    install: "../delft"
+    pythonVirtualEnv:  # Not needed in Docker (Python environment is built-in)
+
+  # Model configuration - selective DeLFT enablement
+  # Enable DeLFT for high-value models, keep CRF for others
+  models:
+    # Citation model - HIGH VALUE for accuracy
+    # Improves citation parsing and DOI extraction by +3-5% F1
+    - name: "citation"
+      engine: "delft"
+      architecture: "BidLSTM_CRF_FEATURES"
+
+    # Affiliation-address - HIGH VALUE for institutional metadata
+    # Better extraction of institution names and locations
+    - name: "affiliation-address"
+      engine: "delft"
+      architecture: "BidLSTM_CRF_FEATURES"
+
+    # Reference-segmenter - HIGH VALUE for reference parsing
+    # Improved segmentation of reference fields (author, title, venue, etc.)
+    # Note: 2-3x slower than CRF but significantly more accurate
+    - name: "reference-segmenter"
+      engine: "delft"
+      architecture: "BidLSTM_ChainCRF_FEATURES"
+
+    # Header model - MEDIUM VALUE for title/authors
+    # Better extraction of document title, authors, and metadata
+    - name: "header"
+      engine: "delft"
+      architecture: "BidLSTM_CRF_FEATURES"
+
+    # Funding-acknowledgement - MEDIUM VALUE for grant information
+    # Improved NER for funding bodies and grant numbers
+    - name: "funding-acknowledgement"
+      engine: "delft"
+      architecture: "BidLSTM_CRF_FEATURES"
+
+    # Fulltext segmentation - KEEP CRF (DL not recommended for long sequences)
+    # CRF performs well here and is much faster
+    - name: "segmentation"
+      engine: "wapiti"
+
+    # Name-citation - KEEP CRF
+    # CRF is sufficient for name parsing in citations
+    - name: "name-citation"
+      engine: "wapiti"
+
+    # Name-header - KEEP CRF
+    # CRF is sufficient for name parsing in headers
+    - name: "name-header"
+      engine: "wapiti"
+
+    # Date - KEEP CRF
+    # CRF handles date extraction well
+    - name: "date"
+      engine: "wapiti"
