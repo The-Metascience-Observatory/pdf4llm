@@ -42,23 +42,86 @@ def _find_grobid_dir(grobid_home: str = None) -> Path:
     )
 
 
-def _start_grobid(grobid_dir: Path, port: int = 8070) -> subprocess.Popen:
-    """Start GROBID service as a background process. Returns the Popen object."""
-    gradlew = grobid_dir / "gradlew"
+def _start_grobid(grobid_dir: Path, port: int = 8070) -> tuple[subprocess.Popen, bool]:
+    """Start GROBID service with DeLFT support as a background process.
+
+    Returns:
+        tuple: (process, using_delft) where using_delft is True if DeLFT models are enabled
+    """
+
+    # Check if we should use the JAR directly (for DeLFT with proper JEP path)
+    jar_path = grobid_dir / "grobid-service" / "build" / "libs"
+    jar_files = list(jar_path.glob("grobid-service-*-onejar.jar")) if jar_path.exists() else []
+
+    # Look for JEP native library
+    jep_paths = [
+        Path.home() / ".local" / "lib" / "python3.12" / "site-packages" / "jep",
+        Path.home() / ".local" / "lib" / "python3.11" / "site-packages" / "jep",
+        Path.home() / ".local" / "lib" / "python3.10" / "site-packages" / "jep",
+    ]
+    jep_lib_path = None
+    for jep_path in jep_paths:
+        if jep_path.exists() and (jep_path / "libjep.so").exists():
+            jep_lib_path = str(jep_path)
+            break
+
+    config_path = grobid_dir / "grobid-home" / "config" / "grobid.yaml"
+
     env = os.environ.copy()
     # Clear CONDA_PREFIX to avoid build.gradle JEP path detection failure
     env.pop("CONDA_PREFIX", None)
     env.pop("VIRTUAL_ENV", None)
 
-    click.echo(f"Starting GROBID from {grobid_dir}...")
-    proc = subprocess.Popen(
-        [str(gradlew), "run"],
-        cwd=str(grobid_dir),
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-    )
-    return proc
+    # If we have a JAR file and JEP library, use direct Java command for DeLFT support
+    if jar_files and jep_lib_path:
+        jar_file = jar_files[0]
+        click.echo(f"Starting GROBID with DeLFT from {grobid_dir}...")
+        click.secho("✓ Using DeLFT deep learning models (highest accuracy)", fg="green", bold=True)
+        java_cmd = [
+            "java",
+            "-Xmx6g",
+            f"-Djava.library.path={jep_lib_path}",
+            "-jar", str(jar_file),
+            "server", str(config_path)
+        ]
+        proc = subprocess.Popen(
+            java_cmd,
+            cwd=str(grobid_dir),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        return proc, True
+    else:
+        # Fallback to gradlew (CRF-only mode)
+        gradlew = grobid_dir / "gradlew"
+        if not gradlew.exists():
+            raise click.ClickException(
+                f"GROBID gradlew not found at {gradlew}. "
+                "Please ensure GROBID is built first."
+            )
+        click.secho("\n" + "="*70, fg="red", bold=True)
+        click.secho("⚠  WARNING: DeLFT NOT AVAILABLE - Using CRF-only mode", fg="red", bold=True)
+        click.secho("   This is NOT the most accurate GROBID version!", fg="red", bold=True)
+        click.secho("="*70 + "\n", fg="red", bold=True)
+
+        # Show why DeLFT isn't available
+        if not jar_files:
+            click.secho(f"   Reason: GROBID JAR not found at {jar_path}", fg="yellow")
+            click.secho("   Solution: Build GROBID with: cd grobid && ./gradlew clean install", fg="yellow")
+        elif not jep_lib_path:
+            click.secho("   Reason: JEP library (libjep.so) not found", fg="yellow")
+            click.secho("   Solution: Install JEP with: pip install jep", fg="yellow")
+
+        click.echo(f"\nStarting GROBID (CRF mode) from {grobid_dir}...")
+        proc = subprocess.Popen(
+            [str(gradlew), "run"],
+            cwd=str(grobid_dir),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        return proc, False
 
 
 def _wait_for_grobid(url: str, timeout: int = 120) -> bool:
@@ -128,7 +191,7 @@ def cli():
 @click.option("--grobid-home", type=click.Path(), default=None,
               help="Path to GROBID source directory (for auto-start)")
 @click.option("--no-auto-grobid", is_flag=True,
-              help="Don't auto-start GROBID (assume it's already running)")
+              help="Don't auto-start GROBID (assume it's already running). By default, GROBID is auto-started with DeLFT if available.")
 @click.option("--docker", "use_docker", is_flag=True,
               help="Use Docker-based GROBID (requires docker/docker-compose.yml)")
 @click.option("--docker-mode", type=click.Choice(["delft", "crf"]), default="delft",
@@ -139,7 +202,8 @@ def convert(pdf_path, output_dir, mode, grobid_url, no_json, save_tei,
             use_docker, docker_mode, verbose):
     """Convert a single PDF to Markdown.
 
-    GROBID is auto-started if not already running (use --no-auto-grobid to disable).
+    GROBID is auto-started with DeLFT (highest accuracy) if not already running.
+    Use --no-auto-grobid to disable auto-start.
 
     Example:
         pdf2md convert paper.pdf -o output/
@@ -234,6 +298,7 @@ def convert(pdf_path, output_dir, mode, grobid_url, no_json, save_tei,
 
     # GROBID lifecycle management
     grobid_proc = None
+    using_delft = False
 
     if config.requires_grobid():
         from .extractors.grobid import GrobidClient
@@ -243,6 +308,10 @@ def convert(pdf_path, output_dir, mode, grobid_url, no_json, save_tei,
 
         if already_running:
             click.secho(" OK", fg="green")
+            # Check if it's using DeLFT by trying to detect from version or config
+            # For now, we'll assume pre-running GROBID might be using DeLFT
+            click.echo("Note: Using existing GROBID instance (unable to verify if DeLFT is enabled)")
+            using_delft = None  # Unknown
         elif no_auto_grobid:
             click.secho(" NOT AVAILABLE", fg="red")
             sys.exit(1)
@@ -250,7 +319,7 @@ def convert(pdf_path, output_dir, mode, grobid_url, no_json, save_tei,
             click.secho(" not running", fg="yellow")
             try:
                 grobid_dir = _find_grobid_dir(grobid_home)
-                grobid_proc = _start_grobid(grobid_dir)
+                grobid_proc, using_delft = _start_grobid(grobid_dir)
                 click.echo(f"Waiting for GROBID to be ready...", nl=False)
                 if _wait_for_grobid(config.grobid_url, timeout=120):
                     click.secho(" OK", fg="green")
@@ -314,7 +383,7 @@ def convert(pdf_path, output_dir, mode, grobid_url, no_json, save_tei,
 @click.option("--grobid-home", type=click.Path(), default=None,
               help="Path to GROBID source directory (for auto-start)")
 @click.option("--no-auto-grobid", is_flag=True,
-              help="Don't auto-start GROBID (assume it's already running)")
+              help="Don't auto-start GROBID (assume it's already running). By default, GROBID is auto-started with DeLFT if available.")
 @click.option("--docker", "use_docker", is_flag=True,
               help="Use Docker-based GROBID (requires docker/docker-compose.yml)")
 @click.option("--docker-mode", type=click.Choice(["delft", "crf"]), default="delft",
@@ -324,7 +393,8 @@ def batch(input_dir, output_dir, mode, grobid_url, workers, timeout, skip_existi
           resume, checkpoint, no_json, grobid_home, no_auto_grobid, use_docker, docker_mode, verbose):
     """Convert a folder of PDFs to Markdown.
 
-    GROBID is auto-started if not already running (use --no-auto-grobid to disable).
+    GROBID is auto-started with DeLFT (highest accuracy) if not already running.
+    Use --no-auto-grobid to disable auto-start.
 
     Example:
         pdf2md batch ./pdfs/ -o ./markdown/ --workers 4
@@ -426,6 +496,7 @@ def batch(input_dir, output_dir, mode, grobid_url, workers, timeout, skip_existi
 
     # GROBID lifecycle management
     grobid_proc = None
+    using_delft = False
 
     if config.requires_grobid():
         from .extractors.grobid import GrobidClient
@@ -435,6 +506,8 @@ def batch(input_dir, output_dir, mode, grobid_url, workers, timeout, skip_existi
 
         if already_running:
             click.secho(" OK", fg="green")
+            click.echo("Note: Using existing GROBID instance (unable to verify if DeLFT is enabled)")
+            using_delft = None  # Unknown
         elif no_auto_grobid:
             click.secho(" NOT AVAILABLE", fg="red")
             click.echo("GROBID is not running and --no-auto-grobid was specified.")
@@ -443,7 +516,7 @@ def batch(input_dir, output_dir, mode, grobid_url, workers, timeout, skip_existi
             click.secho(" not running", fg="yellow")
             try:
                 grobid_dir = _find_grobid_dir(grobid_home)
-                grobid_proc = _start_grobid(grobid_dir)
+                grobid_proc, using_delft = _start_grobid(grobid_dir)
                 click.echo(f"Waiting for GROBID to be ready at {config.grobid_url}...", nl=False)
                 if _wait_for_grobid(config.grobid_url, timeout=120):
                     click.secho(" OK", fg="green")

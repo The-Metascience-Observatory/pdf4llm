@@ -88,24 +88,49 @@ cd grobid
 
 The build downloads models and dependencies on first run. This takes a while.
 
-### Starting GROBID (for testing)
+### GROBID Auto-Start (Recommended)
 
+**pdf2mdjson automatically starts GROBID with DeLFT (highest accuracy) when needed!**
+
+When you run `pdf2mdjson convert` or `pdf2mdjson batch`, it will:
+1. Check if GROBID is already running on port 8070
+2. If not, automatically start GROBID with DeLFT deep learning models (if available)
+3. Use the pre-built JAR for proper JEP/DeLFT integration
+4. Stop GROBID when processing completes
+
+No manual GROBID management required! Just run:
+```bash
+pdf2mdjson convert paper.pdf -o output/
+```
+
+### Manual GROBID Start (Optional)
+
+If you prefer to manage GROBID manually or want to keep it running between commands:
+
+**With DeLFT (highest accuracy):**
+```bash
+cd /path/to/grobid
+java -Xmx6g \
+  -Djava.library.path=$HOME/.local/lib/python3.12/site-packages/jep \
+  -jar grobid-service/build/libs/grobid-service-*-onejar.jar \
+  server grobid-home/config/grobid.yaml
+```
+
+**Without DeLFT (faster, CRF-only):**
 ```bash
 cd /path/to/grobid
 ./gradlew run
 ```
 
-GROBID starts on **port 8070** by default. The Gradle process will hang at ~88% — this is normal, the service is running.
+Then use `--no-auto-grobid` flag:
+```bash
+pdf2mdjson convert paper.pdf -o output/ --no-auto-grobid
+```
 
-Verify it's up:
-
+**Note:** GROBID starts on **port 8070** by default. Verify it's up with:
 ```bash
 curl http://localhost:8070/api/isalive
 ```
-
-**Note:** pdf2mdjson auto-starts GROBID if it finds the `grobid/` directory as a sibling. You can also point to it explicitly with `--grobid-home /path/to/grobid`.
-
-**Important:** If you're running inside a conda or virtualenv, GROBID's Gradle build may fail due to JEP path detection issues. pdf2mdjson clears `CONDA_PREFIX` and `VIRTUAL_ENV` from the environment when auto-starting GROBID, but if you start GROBID manually you may need to deactivate your environment first or unset those variables.
 
 ## Usage
 
