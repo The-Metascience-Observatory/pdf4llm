@@ -2,7 +2,7 @@
 OCR fallback extraction for scanned PDFs or poor-quality extractions.
 
 Uses PyMuPDF's built-in OCR capabilities (via Tesseract) when GROBID
-produces low-quality results (quality score < 0.5).
+produces low-quality results (quality score < 0.6).
 """
 
 import logging
@@ -19,7 +19,7 @@ from ..models import (
 logger = logging.getLogger(__name__)
 
 # Minimum quality score threshold for triggering OCR fallback
-OCR_FALLBACK_THRESHOLD = 0.5
+OCR_FALLBACK_THRESHOLD = 0.6
 
 
 def needs_ocr_fallback(quality_score: float) -> bool:

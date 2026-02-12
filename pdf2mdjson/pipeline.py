@@ -10,6 +10,7 @@ Handles:
 
 import json
 import logging
+import shutil
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -342,6 +343,15 @@ class BatchProcessor:
                 logger.warning(f"Failed to load checkpoint: {e}")
         return set()
 
+    @staticmethod
+    def _move_pdf(pdf_path: Path, output_dir: Path):
+        """Move the source PDF into its output folder."""
+        src = Path(pdf_path).resolve()
+        dst = output_dir / src.name
+        if src != dst and src.exists():
+            shutil.move(str(src), str(dst))
+            logger.info(f"Moved PDF to {dst}")
+
     def _save_checkpoint(self, pdf_path: str):
         """Save checkpoint after successful processing."""
         if not self.checkpoint_file:
@@ -364,6 +374,7 @@ class BatchProcessor:
         output_dir: Path,
         resume: bool = True,
         skip_existing: bool = False,
+        move_pdf: bool = False,
     ) -> BatchResult:
         """
         Process all PDFs in a folder.
@@ -437,6 +448,8 @@ class BatchProcessor:
 
                 if result.status != "failed":
                     self._save_checkpoint(str(pdf_path))
+                    if move_pdf and result.output_dir:
+                        self._move_pdf(pdf_path, Path(result.output_dir))
 
                 for error in result.errors:
                     error_summary[error.error_type] = error_summary.get(error.error_type, 0) + 1
@@ -456,6 +469,8 @@ class BatchProcessor:
 
                         if result.status != "failed":
                             self._save_checkpoint(str(pdf_path))
+                            if move_pdf and result.output_dir:
+                                self._move_pdf(pdf_path, Path(result.output_dir))
 
                         for error in result.errors:
                             error_summary[error.error_type] = error_summary.get(error.error_type, 0) + 1

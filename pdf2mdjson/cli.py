@@ -11,6 +11,7 @@ Usage:
 
 import logging
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -196,10 +197,12 @@ def cli():
               help="Use Docker-based GROBID (requires docker/docker-compose.yml)")
 @click.option("--docker-mode", type=click.Choice(["delft", "crf"]), default="delft",
               help="Docker GROBID mode: delft (high accuracy) or crf (fastest)")
+@click.option("--movepdf", is_flag=True,
+              help="Move the input PDF into the output folder after successful processing")
 @click.option("-v", "--verbose", is_flag=True, help="Verbose output")
 def convert(pdf_path, output_dir, mode, grobid_url, no_json, save_tei,
             extract_charts, chart_model, ollama_url, grobid_home, no_auto_grobid,
-            use_docker, docker_mode, verbose):
+            use_docker, docker_mode, movepdf, verbose):
     """Convert a single PDF to Markdown.
 
     GROBID is auto-started with DeLFT (highest accuracy) if not already running.
@@ -207,7 +210,7 @@ def convert(pdf_path, output_dir, mode, grobid_url, no_json, save_tei,
 
     Example:
         pdf2md convert paper.pdf -o output/
-        pdf2md convert paper.pdf -o output/ --extract-charts
+        pdf2md convert paper.pdf -o output/ --movepdf
     """
     setup_logging(verbose)
 
@@ -358,6 +361,14 @@ def convert(pdf_path, output_dir, mode, grobid_url, no_json, save_tei,
             click.echo(f"  Error ({error.stage}): {error.message}")
         sys.exit(1)
 
+    # Move PDF into output folder if requested
+    if movepdf and result.status in ("success", "partial"):
+        src = Path(pdf_path).resolve()
+        dst = Path(result.output_dir) / src.name
+        if src != dst:
+            shutil.move(str(src), str(dst))
+            click.echo(f"Moved PDF to {dst}")
+
     click.echo(f"Processing time: {result.processing_time_seconds:.2f}s")
 
 
@@ -388,9 +399,11 @@ def convert(pdf_path, output_dir, mode, grobid_url, no_json, save_tei,
               help="Use Docker-based GROBID (requires docker/docker-compose.yml)")
 @click.option("--docker-mode", type=click.Choice(["delft", "crf"]), default="delft",
               help="Docker GROBID mode: delft (high accuracy) or crf (fastest)")
+@click.option("--movepdf", is_flag=True,
+              help="Move each input PDF into its output folder after successful processing")
 @click.option("-v", "--verbose", is_flag=True, help="Verbose output")
 def batch(input_dir, output_dir, mode, grobid_url, workers, timeout, skip_existing,
-          resume, checkpoint, no_json, grobid_home, no_auto_grobid, use_docker, docker_mode, verbose):
+          resume, checkpoint, no_json, grobid_home, no_auto_grobid, use_docker, docker_mode, movepdf, verbose):
     """Convert a folder of PDFs to Markdown.
 
     GROBID is auto-started with DeLFT (highest accuracy) if not already running.
@@ -399,7 +412,7 @@ def batch(input_dir, output_dir, mode, grobid_url, workers, timeout, skip_existi
     Example:
         pdf2md batch ./pdfs/ -o ./markdown/ --workers 4
         pdf2md batch ./pdfs/ -o ./markdown/ --resume
-        pdf2md batch ./pdfs/ -o ./markdown/ --skip-existing --workers 1 --timeout 300
+        pdf2md batch ./pdfs/ -o ./markdown/ --movepdf
     """
     setup_logging(verbose)
 
@@ -536,6 +549,7 @@ def batch(input_dir, output_dir, mode, grobid_url, workers, timeout, skip_existi
             output_dir=Path(output_dir),
             resume=resume,
             skip_existing=skip_existing,
+            move_pdf=movepdf,
         )
     except Exception as e:
         click.secho(f"Error: {e}", fg="red")
