@@ -677,37 +677,90 @@ def _parse_citation_tei_fragment(tei_text: str) -> Optional[Reference]:
     """
     Parse a TEI fragment returned by GROBID /api/processCitation.
 
-    The response is a full TEI document or a bare <biblStruct> element.
-    Reuses the same extraction helpers used for full-document references.
+    The processCitation response is a bare <biblStruct> with NO XML namespace,
+    so we cannot reuse the namespace-aware _extract_reference_* helpers here.
+    Instead, we use plain (namespace-free) XPath directly.
     """
     try:
         root = etree.fromstring(tei_text.encode("utf-8"))
     except etree.XMLSyntaxError:
         return None
 
-    # Find biblStruct — try with namespace first, then without
-    biblstruct = root.find(".//tei:biblStruct", TEI_NS)
-    if biblstruct is None:
-        biblstruct = root.find(".//biblStruct")
-    if biblstruct is None:
-        # Maybe root itself is the biblStruct
-        local = root.tag.split("}")[-1] if "}" in root.tag else root.tag
-        if local == "biblStruct":
-            biblstruct = root
-    if biblstruct is None:
-        return None
+    # The root may be <biblStruct> itself or wrapped — find it either way
+    local = root.tag.split("}")[-1] if "}" in root.tag else root.tag
+    if local == "biblStruct":
+        bs = root
+    else:
+        bs = root.find(".//biblStruct")
+        if bs is None:
+            return None
+
+    def _text(elem):
+        return "".join(elem.itertext()).strip() if elem is not None else ""
+
+    # Title — prefer analytic (article title), fall back to monogr
+    # NOTE: lxml elements are falsy when childless, so use `is not None` not `or`
+    title_elem = bs.find(".//analytic/title")
+    if title_elem is None:
+        title_elem = bs.find(".//monogr/title")
+    title = _text(title_elem) or None
+
+    # Authors
+    authors = []
+    for author in bs.findall(".//author"):
+        pn = author.find("persName")
+        if pn is None:
+            continue
+        surname = _text(pn.find("surname"))
+        forenames = [_text(f) for f in pn.findall("forename") if _text(f)]
+        if surname:
+            initials = "".join(f[0] for f in forenames if f)
+            authors.append(f"{surname} {initials}".strip() if initials else surname)
+
+    # Journal (from monogr/title[@level='j'], else any monogr/title)
+    j_elem = bs.find(".//monogr/title[@level='j']")
+    if j_elem is None:
+        j_elem = bs.find(".//monogr/title")
+    journal = _text(j_elem) or None
+    # Don't duplicate: if journal == title (book case with no analytic), clear journal
+    if journal and title and journal == title:
+        journal = None
+
+    # Year
+    year = None
+    date = bs.find(".//date[@type='published']") or bs.find(".//date")
+    if date is not None:
+        when = date.get("when", "")
+        m = re.match(r"(\d{4})", when or _text(date))
+        if m:
+            year = int(m.group(1))
+
+    def _scope(unit):
+        el = bs.find(f".//biblScope[@unit='{unit}']")
+        if el is None:
+            return None
+        f, t = el.get("from", ""), el.get("to", "")
+        if f and t:
+            return f"{f}-{t}"
+        return f or _text(el) or None
+
+    # DOI
+    doi = None
+    doi_el = bs.find(".//idno[@type='DOI']")
+    if doi_el is not None and doi_el.text:
+        doi = _normalize_doi(doi_el.text)
 
     from ..models import Reference as _Ref
     return _Ref(
         num=0,  # caller sets the real number
-        doi=_extract_reference_doi(biblstruct),
-        title=_extract_reference_title(biblstruct),
-        authors=_extract_reference_authors(biblstruct),
-        journal=_extract_reference_journal(biblstruct),
-        year=_extract_reference_year(biblstruct),
-        volume=_extract_bibl_scope(biblstruct, "volume"),
-        issue=_extract_bibl_scope(biblstruct, "issue"),
-        pages=_extract_bibl_scope(biblstruct, "page"),
+        doi=doi,
+        title=title,
+        authors=authors,
+        journal=journal,
+        year=year,
+        volume=_scope("volume"),
+        issue=_scope("issue"),
+        pages=_scope("page"),
     )
 
 

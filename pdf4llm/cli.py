@@ -530,7 +530,8 @@ def convert(pdf_path, output_dir, mode, grobid_url, no_json, save_tei,
         dst = Path(result.output_dir) / src.name
         if src != dst:
             shutil.move(str(src), str(dst))
-            click.echo(f"Moved PDF to {dst}")
+            if verbose:
+                click.echo(f"Moved PDF to {dst}")
 
     click.echo(f"Processing time: {result.processing_time_seconds:.2f}s")
 

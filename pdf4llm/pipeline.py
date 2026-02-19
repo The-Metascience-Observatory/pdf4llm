@@ -517,7 +517,7 @@ class BatchProcessor:
         dst = output_dir / src.name
         if src != dst and src.exists():
             shutil.move(str(src), str(dst))
-            logger.info(f"Moved PDF to {dst}")
+            #logger.info(f"Moved PDF to {dst}")
 
     def _save_checkpoint(self, pdf_path: str):
         """Save checkpoint after successful processing."""
