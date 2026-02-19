@@ -23,7 +23,7 @@ from .config import Config, ExtractionMode
 from .models import (
     DocumentModel, ProcessingResult, ProcessingError, BatchResult, Figure
 )
-from .extractors.grobid import extract_with_grobid, GrobidError, GrobidClient
+from .extractors.grobid import extract_with_grobid, GrobidError, GrobidScannedPdfError, GrobidClient
 from .extractors.fast import extract_fast, _extract_doi_from_filename
 from .extractors.tables import assess_table_quality
 from .extractors.ocr_fallback import needs_ocr_fallback, extract_with_ocr
@@ -32,6 +32,55 @@ from .renderers.json_output import render_json, render_references_json
 from .validation import validate_document
 
 logger = logging.getLogger(__name__)
+
+
+_GROBID_CRASH_MARKERS = ("crashed", "connection refused", "out of memory")
+
+# Minimum body.md character count — multi-page PDFs below this threshold are
+# candidates for OCR re-extraction (likely scanned or very sparse text layer).
+_BODY_MD_MIN_SIZE = 2000
+
+
+def _is_grobid_crash(error: Exception) -> bool:
+    """Return True when an error indicates GROBID process crash/OOM."""
+    message = str(error).lower()
+    return any(marker in message for marker in _GROBID_CRASH_MARKERS)
+
+
+def _build_grobid_oom_error(pdf_name: str, processed_count: int) -> GrobidError:
+    """Create consistent, actionable error message for GROBID crashes."""
+    return GrobidError(
+        f"\n\nGROBID OUT OF MEMORY - server crashed while processing {pdf_name}.\n"
+        f"Successfully processed {processed_count} PDFs before crash.\n"
+        "To fix: restart GROBID and rerun with fewer workers (e.g. --workers 2 --resume)\n"
+    )
+
+
+def _get_pdf_page_count(pdf_path: Path) -> int:
+    """Return the number of pages in a PDF, or 0 on error."""
+    try:
+        import fitz
+        doc = fitz.open(str(pdf_path))
+        count = doc.page_count
+        doc.close()
+        return count
+    except Exception:
+        return 0  # Unknown — skip the size check rather than risk false positives
+
+
+def _build_failed_processing_result(pdf_path: Path, error: Exception) -> ProcessingResult:
+    """Create a standardized failed processing result for batch mode."""
+    return ProcessingResult(
+        pdf_path=str(pdf_path),
+        status="failed",
+        errors=[ProcessingError(
+            stage="execution",
+            error_type=type(error).__name__,
+            message=str(error),
+            recoverable=False,
+        )],
+        processing_time_seconds=0,
+    )
 
 
 def convert_single(
@@ -67,16 +116,20 @@ def convert_single(
         if config.mode == ExtractionMode.FULL_GROBID:
             try:
                 tei_xml, document = extract_with_grobid(pdf_path, config)
+            except GrobidScannedPdfError as e:
+                # Scanned PDF: skip fast extraction (useless for image-only PDFs),
+                # go directly to Tesseract OCR
+                logger.warning(f"Scanned PDF detected ({pdf_path.name}), using Tesseract OCR directly")
+                warnings.append("Scanned PDF detected (no text layer); using Tesseract OCR")
+                document = extract_with_ocr(pdf_path, config)
+                document.metadata.extraction_mode = "ocr-scanned"
             except GrobidError as e:
-                if "crashed" in str(e).lower() or "connection refused" in str(e).lower():
+                if _is_grobid_crash(e):
                     raise  # OOM / crash - don't silently fall back, abort
-                logger.warning(f"GROBID failed for {pdf_path.name}, falling back to fast: {e}")
-                warnings.append(f"GROBID failed, falling back to fast extraction: {e}")
-                document = extract_fast(pdf_path, config)
-                document.metadata.extraction_mode = "fast-fallback"
-                document.metadata.warnings.append(
-                    "GROBID unavailable; used fast extraction as fallback"
-                )
+                logger.warning(f"GROBID failed for {pdf_path.name}, falling back to OCR: {e}")
+                warnings.append(f"GROBID failed, falling back to Tesseract OCR: {e}")
+                document = extract_with_ocr(pdf_path, config)
+                document.metadata.extraction_mode = "ocr-fallback"
 
         elif config.mode == ExtractionMode.FAST:
             document = extract_fast(pdf_path, config)
@@ -140,6 +193,22 @@ def convert_single(
                     # Analyze figures with vision model
                     analyzed_figures = extractor.analyze_all_figures(extracted_figures)
 
+                    # Save figure images to separate files
+                    effective_output_dir.mkdir(parents=True, exist_ok=True)
+                    for fig in analyzed_figures:
+                        # Extract page number and figure index from figure_id (e.g., "fig_8_1" -> page 8, fig 1)
+                        parts = fig.figure_id.split("_")
+                        if len(parts) >= 3:
+                            page_num = parts[1]
+                            fig_num = parts[2]
+                            img_filename = f"page_{page_num}_fig_{fig_num}.png"
+                        else:
+                            img_filename = f"{fig.figure_id}.png"
+
+                        img_path = effective_output_dir / img_filename
+                        img_path.write_bytes(fig.image_data)
+                        logger.info(f"Saved figure to {img_path}")
+
                     # Convert to Figure model and add to document
                     document.figures = [
                         Figure(
@@ -159,7 +228,7 @@ def convert_single(
                 logger.warning(f"Chart extraction failed for {pdf_path}: {e}")
 
     except GrobidError as e:
-        if "crashed" in str(e).lower() or "connection refused" in str(e).lower():
+        if _is_grobid_crash(e):
             raise  # OOM / crash - propagate to stop the batch
         errors.append(ProcessingError(
             stage="grobid",
@@ -227,6 +296,51 @@ def convert_single(
                 logger.warning(f"OCR fallback failed: {e}")
                 warnings.append(f"OCR fallback failed: {e}")
 
+        # Body size check: if GROBID produced very little body content and the PDF
+        # has more than one page, the text layer is likely sparse/scanned — retry
+        # with Tesseract OCR. Single-page PDFs are excluded because a small body
+        # is perfectly normal (e.g. a letter, abstract-only doc, or short note).
+        if (document
+                and "ocr" not in (document.metadata.extraction_mode or "")
+                and config.mode == ExtractionMode.FULL_GROBID):
+            body_md_preview = render_body_md(document)
+            if len(body_md_preview) < _BODY_MD_MIN_SIZE:
+                pdf_pages = _get_pdf_page_count(pdf_path)
+                if pdf_pages > 1:
+                    logger.info(
+                        f"Body content very small ({len(body_md_preview)} chars) for "
+                        f"{pdf_path.name} ({pdf_pages} pages), retrying with Tesseract OCR"
+                    )
+                    try:
+                        ocr_doc = extract_with_ocr(pdf_path, config)
+                        ocr_body_preview = render_body_md(ocr_doc)
+                        if len(ocr_body_preview) > len(body_md_preview):
+                            logger.info(
+                                f"OCR retry improved body: {len(body_md_preview)} → "
+                                f"{len(ocr_body_preview)} chars"
+                            )
+                            document = ocr_doc
+                            warnings.append(
+                                f"GROBID body too small ({len(body_md_preview)} chars), "
+                                f"switched to Tesseract OCR ({len(ocr_body_preview)} chars)"
+                            )
+                        else:
+                            logger.info(
+                                f"OCR retry did not improve body size "
+                                f"({len(ocr_body_preview)} vs {len(body_md_preview)}), keeping GROBID result"
+                            )
+                    except Exception as e:
+                        logger.warning(f"OCR retry for small body failed: {e}")
+
+    # Re-parse OCR references via GROBID citation parser for structured output
+    if (document
+            and "ocr" in (document.metadata.extraction_mode or "")
+            and config.requires_grobid()):
+        try:
+            _enrich_ocr_references(document, config)
+        except Exception as e:
+            logger.warning(f"OCR reference enrichment failed: {e}")
+
     # Render outputs if we have a document
     result_output_dir = None
 
@@ -282,6 +396,55 @@ def convert_single(
         warnings=warnings,
         processing_time_seconds=round(processing_time, 2),
     )
+
+
+def _enrich_ocr_references(document: DocumentModel, config: Config) -> None:
+    """
+    Re-parse OCR-extracted references using GROBID /api/processCitation.
+
+    OCR reference extraction is very basic (raw text → title field).
+    This sends each raw reference string to GROBID's citation parser to
+    get proper structured output (authors, journal, year, volume, pages, DOI).
+
+    Modifies document.references in-place.
+    """
+    if not document.references:
+        return
+
+    client = GrobidClient(config)
+    try:
+        if not client.is_alive(timeout=5):
+            logger.debug("GROBID not available for OCR reference enrichment")
+            return
+    except Exception:
+        return
+
+    logger.info(f"Enriching {len(document.references)} OCR references via GROBID citation parser")
+    enriched = []
+    improved = 0
+
+    for ref in document.references:
+        raw = ref.raw_text or ref.title or ""
+        if not raw.strip():
+            enriched.append(ref)
+            continue
+
+        parsed = client.process_citation(raw)
+        if parsed and (parsed.title or parsed.authors):
+            # Preserve original num, raw_text, and any DOI already found
+            enriched.append(parsed.model_copy(update={
+                "num": ref.num,
+                "raw_text": raw,
+                "doi": parsed.doi or ref.doi,
+            }))
+            improved += 1
+        else:
+            enriched.append(ref)
+
+    document.references = enriched
+    document.metadata.references_with_doi = sum(1 for r in enriched if r.doi)
+    if improved:
+        logger.info(f"GROBID structured {improved}/{len(enriched)} OCR references")
 
 
 def _check_hybrid_fallback_needed(
@@ -396,8 +559,11 @@ class BatchProcessor:
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Find all PDFs
-        pdfs = list(input_dir.glob("**/*.pdf"))
+        # Find all PDFs — glob("**/*.pdf") misses root-level files in Python <3.12,
+        # so explicitly combine root-level and recursive results.
+        pdfs = list(dict.fromkeys(
+            list(input_dir.glob("*.pdf")) + list(input_dir.glob("**/*.pdf"))
+        ))
         logger.info(f"Found {len(pdfs)} PDFs in {input_dir}")
 
         # Filter already processed if resuming from checkpoint
@@ -407,13 +573,14 @@ class BatchProcessor:
             logger.info(f"Resuming: {original_count - len(pdfs)} already processed, "
                        f"{len(pdfs)} remaining")
 
-        # Filter PDFs that already have output folders
+        # Filter PDFs that already have output folders with content
         if skip_existing:
             original_count = len(pdfs)
             pdfs_to_process = []
             for pdf in pdfs:
                 stem = pdf.stem
-                if (output_dir / stem / "abstract.md").exists():
+                out = output_dir / stem
+                if out.exists() and (out / "abstract.md").exists() and (out / "body.md").exists():
                     continue
                 pdfs_to_process.append(pdf)
             pdfs = pdfs_to_process
@@ -450,12 +617,8 @@ class BatchProcessor:
                 try:
                     result = convert_single(pdf_path, output_dir, self.config)
                 except GrobidError as e:
-                    if "crashed" in str(e).lower() or "connection refused" in str(e).lower():
-                        raise GrobidError(
-                            f"\n\nGROBID OUT OF MEMORY - server crashed while processing {pdf_path.name}.\n"
-                            f"Successfully processed {len(results)} PDFs before crash.\n"
-                            f"To fix: restart GROBID and rerun with fewer workers (e.g. --workers 2 --resume)\n"
-                        )
+                    if _is_grobid_crash(e):
+                        raise _build_grobid_oom_error(pdf_path.name, len(results))
                     raise
                 results.append(result)
 
@@ -489,40 +652,16 @@ class BatchProcessor:
                             error_summary[error.error_type] = error_summary.get(error.error_type, 0) + 1
 
                     except GrobidError as e:
-                        if "crashed" in str(e).lower() or "connection refused" in str(e).lower():
+                        if _is_grobid_crash(e):
                             # Cancel remaining futures
                             for f in futures:
                                 f.cancel()
-                            raise GrobidError(
-                                f"\n\nGROBID OUT OF MEMORY - server crashed while processing {pdf_path.name}.\n"
-                                f"Successfully processed {len(results)} PDFs before crash.\n"
-                                f"To fix: restart GROBID and rerun with fewer workers (e.g. --workers 2 --resume)\n"
-                            )
+                            raise _build_grobid_oom_error(pdf_path.name, len(results))
                         logger.error(f"Failed to process {pdf_path}: {e}")
-                        results.append(ProcessingResult(
-                            pdf_path=str(pdf_path),
-                            status="failed",
-                            errors=[ProcessingError(
-                                stage="execution",
-                                error_type=type(e).__name__,
-                                message=str(e),
-                                recoverable=False,
-                            )],
-                            processing_time_seconds=0,
-                        ))
+                        results.append(_build_failed_processing_result(pdf_path, e))
                     except Exception as e:
                         logger.error(f"Failed to process {pdf_path}: {e}")
-                        results.append(ProcessingResult(
-                            pdf_path=str(pdf_path),
-                            status="failed",
-                            errors=[ProcessingError(
-                                stage="execution",
-                                error_type=type(e).__name__,
-                                message=str(e),
-                                recoverable=False,
-                            )],
-                            processing_time_seconds=0,
-                        ))
+                        results.append(_build_failed_processing_result(pdf_path, e))
 
         total_time = time.time() - start_time
 

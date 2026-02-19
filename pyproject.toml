@@ -3,7 +3,7 @@ requires = ["setuptools>=64"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "pdf2mdjson"
+name = "pdf4llm"
 version = "1.0.0"
 description = "PDF-to-Markdown and JSON converter optimized for LLM analysis of scientific papers"
 requires-python = ">=3.9"
@@ -27,7 +27,7 @@ dev = [
 ]
 
 [project.scripts]
-pdf2mdjson = "pdf2mdjson.cli:main"
+pdf4llm = "pdf4llm.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["pdf2mdjson*"]
+include = ["pdf4llm*"]

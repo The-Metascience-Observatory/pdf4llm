@@ -1,16 +1,30 @@
-# pdf2mdjson
+# pdf4llm
 
 PDF-to-Markdown and JSON converter optimized for LLM analysis of scientific papers. Extracts structured content (sections, tables, figures, references with DOIs) from academic PDFs using [GROBID](https://github.com/kermitt2/grobid).
 
 ## Installation
 
-### 1. Install pdf2mdjson
+### 1. Install pdf4llm
 
 ```bash
 pip install -e .
 ```
 
-This gives you the `pdf2mdjson` CLI command.
+This gives you the `pdf4llm` CLI command.
+
+### 1b. Install Tesseract OCR (recommended)
+
+Tesseract is used as a fallback when PDF extraction quality is below 60%. Without it, low-quality extractions cannot be retried with OCR.
+
+```bash
+# Ubuntu/Debian
+sudo apt-get install tesseract-ocr
+
+# macOS
+brew install tesseract
+```
+
+The Python wrapper (`pytesseract`) is installed automatically with pdf4llm. A yellow warning will appear at runtime if the Tesseract binary is missing.
 
 ### 2a. Install GROBID via Docker (Recommended for DeLFT)
 
@@ -20,7 +34,7 @@ This gives you the `pdf2mdjson` CLI command.
 
 ```bash
 # Start GROBID with DeLFT models (high accuracy, CPU)
-cd /path/to/pdf2mdjson
+cd /path/to/pdf4llm
 ./docker/start-grobid.sh delft
 
 # Or for fastest CPU performance (CRF-only)
@@ -35,15 +49,15 @@ cd /path/to/pdf2mdjson
 - **DeLFT mode:** ~15-30s per PDF (highest accuracy, +3-5% improvement over CRF)
 - **CRF mode:** ~3-5s per PDF (fast, good accuracy)
 
-**Using Docker GROBID with pdf2mdjson:**
+**Using Docker GROBID with pdf4llm:**
 
 ```bash
 # Automatic Docker startup
-pdf2mdjson convert paper.pdf -o output/ --docker --docker-mode delft
+pdf4llm convert paper.pdf -o output/ --docker --docker-mode delft
 
 # Or start Docker manually and connect
 ./docker/start-grobid.sh delft
-pdf2mdjson convert paper.pdf -o output/ --no-auto-grobid
+pdf4llm convert paper.pdf -o output/ --no-auto-grobid
 ```
 
 **Configuration:**
@@ -58,7 +72,7 @@ Edit `docker/grobid-delft-cpu.yaml` to customize which models use DeLFT:
 
 **Stop GROBID:**
 ```bash
-cd /path/to/pdf2mdjson
+cd /path/to/pdf4llm
 docker compose -f docker/docker-compose.yml down
 ```
 
@@ -76,10 +90,10 @@ sudo apt install openjdk-21-jdk
 brew install openjdk@21
 ```
 
-Clone and build GROBID as a sibling directory (the default location pdf2mdjson looks for):
+Clone and build GROBID as a sibling directory (the default location pdf4llm looks for):
 
 ```bash
-# From the parent directory of pdf2mdjson
+# From the parent directory of pdf4llm
 cd ..
 git clone https://github.com/kermitt2/grobid.git
 cd grobid
@@ -90,9 +104,9 @@ The build downloads models and dependencies on first run. This takes a while.
 
 ### GROBID Auto-Start (Recommended)
 
-**pdf2mdjson automatically starts GROBID with DeLFT (highest accuracy) when needed!**
+**pdf4llm automatically starts GROBID with DeLFT (highest accuracy) when needed!**
 
-When you run `pdf2mdjson convert` or `pdf2mdjson batch`, it will:
+When you run `pdf4llm convert` or `pdf4llm batch`, it will:
 1. Check if GROBID is already running on port 8070
 2. If not, automatically start GROBID with DeLFT deep learning models (if available)
 3. Use the pre-built JAR for proper JEP/DeLFT integration
@@ -100,7 +114,7 @@ When you run `pdf2mdjson convert` or `pdf2mdjson batch`, it will:
 
 No manual GROBID management required! Just run:
 ```bash
-pdf2mdjson convert paper.pdf -o output/
+pdf4llm convert paper.pdf -o output/
 ```
 
 ### Manual GROBID Start (Optional)
@@ -124,7 +138,7 @@ cd /path/to/grobid
 
 Then use `--no-auto-grobid` flag:
 ```bash
-pdf2mdjson convert paper.pdf -o output/ --no-auto-grobid
+pdf4llm convert paper.pdf -o output/ --no-auto-grobid
 ```
 
 **Note:** GROBID starts on **port 8070** by default. Verify it's up with:
@@ -137,25 +151,25 @@ curl http://localhost:8070/api/isalive
 ### Convert a single PDF
 
 ```bash
-pdf2mdjson convert paper.pdf -o output/
+pdf4llm convert paper.pdf -o output/
 ```
 
 ### Batch convert a folder of PDFs
 
 ```bash
-pdf2mdjson batch ./pdfs/ -o ./output/ --workers 4
+pdf4llm batch ./pdfs/ -o ./output/ --workers 4
 ```
 
 Resume an interrupted batch:
 
 ```bash
-pdf2mdjson batch ./pdfs/ -o ./output/ --resume
+pdf4llm batch ./pdfs/ -o ./output/ --resume
 ```
 
 Skip already-converted PDFs:
 
 ```bash
-pdf2mdjson batch ./pdfs/ -o ./output/ --skip-existing
+pdf4llm batch ./pdfs/ -o ./output/ --skip-existing
 ```
 
 ### Fast mode (no GROBID)
@@ -163,7 +177,7 @@ pdf2mdjson batch ./pdfs/ -o ./output/ --skip-existing
 Uses PyMuPDF + pdfplumber only. Faster but lower quality, especially for references and tables.
 
 ```bash
-pdf2mdjson convert paper.pdf -o output/ --mode fast
+pdf4llm convert paper.pdf -o output/ --mode fast
 ```
 
 ### Hybrid mode
@@ -171,13 +185,13 @@ pdf2mdjson convert paper.pdf -o output/ --mode fast
 Fast extraction with GROBID fallback for low-quality fields:
 
 ```bash
-pdf2mdjson convert paper.pdf -o output/ --mode hybrid
+pdf4llm convert paper.pdf -o output/ --mode hybrid
 ```
 
 ### Check GROBID status
 
 ```bash
-pdf2mdjson health-check
+pdf4llm health-check
 ```
 
 ### Chart extraction (experimental)
@@ -185,7 +199,7 @@ pdf2mdjson health-check
 Requires [Ollama](https://ollama.ai/) running locally with a vision model:
 
 ```bash
-pdf2mdjson convert paper.pdf -o output/ --extract-charts
+pdf4llm convert paper.pdf -o output/ --extract-charts
 ```
 
 ## Extraction modes
@@ -211,8 +225,8 @@ Each PDF produces a DOI-named subfolder containing:
 ## Python API
 
 ```python
-from pdf2mdjson import Config, ExtractionMode
-from pdf2mdjson.pipeline import convert_single
+from pdf4llm import Config, ExtractionMode
+from pdf4llm.pipeline import convert_single
 from pathlib import Path
 
 config = Config(mode=ExtractionMode.FULL_GROBID)

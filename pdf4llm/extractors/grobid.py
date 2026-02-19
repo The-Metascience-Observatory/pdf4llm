@@ -33,6 +33,15 @@ class GrobidError(Exception):
     pass
 
 
+class GrobidScannedPdfError(GrobidError):
+    """Raised when GROBID detects a scanned PDF with no extractable text blocks.
+
+    This typically means the PDF contains only images (no text layer) and
+    requires OCR to extract content.
+    """
+    pass
+
+
 class GrobidClient:
     """Client for interacting with GROBID server."""
 
@@ -55,6 +64,24 @@ class GrobidClient:
             return response.status_code == 200
         except requests.RequestException:
             return False
+
+    def process_citation(self, raw_citation: str, timeout: int = 15) -> Optional["Reference"]:
+        """
+        Parse a single raw citation string using GROBID /api/processCitation.
+
+        Returns a partially-populated Reference (num=0) or None on failure.
+        """
+        try:
+            response = requests.post(
+                f"{self.base_url}/api/processCitation",
+                data={"citations": raw_citation, "consolidateCitations": "0"},
+                timeout=timeout,
+            )
+            if response.status_code == 200 and response.text.strip():
+                return _parse_citation_tei_fragment(response.text)
+        except requests.RequestException as e:
+            logger.debug(f"GROBID processCitation failed: {e}")
+        return None
 
     def get_version(self, timeout: int = 60) -> Optional[str]:
         """Get GROBID version."""
@@ -111,8 +138,13 @@ class GrobidClient:
                     time.sleep(self.config.grobid_retry_delay * (attempt + 1))
                     continue
                 else:
+                    error_text = response.text[:300]
+                    if "[NO_BLOCKS]" in response.text:
+                        raise GrobidScannedPdfError(
+                            f"GROBID returned status {response.status_code}: {error_text}"
+                        )
                     raise GrobidError(
-                        f"GROBID returned status {response.status_code}: {response.text[:200]}"
+                        f"GROBID returned status {response.status_code}: {error_text}"
                     )
 
             except requests.Timeout:
@@ -639,6 +671,44 @@ def _get_text_content(elem: etree._Element) -> str:
 
 
 _TEI_REF_TAG = f"{{{TEI_NS['tei']}}}ref"
+
+
+def _parse_citation_tei_fragment(tei_text: str) -> Optional[Reference]:
+    """
+    Parse a TEI fragment returned by GROBID /api/processCitation.
+
+    The response is a full TEI document or a bare <biblStruct> element.
+    Reuses the same extraction helpers used for full-document references.
+    """
+    try:
+        root = etree.fromstring(tei_text.encode("utf-8"))
+    except etree.XMLSyntaxError:
+        return None
+
+    # Find biblStruct — try with namespace first, then without
+    biblstruct = root.find(".//tei:biblStruct", TEI_NS)
+    if biblstruct is None:
+        biblstruct = root.find(".//biblStruct")
+    if biblstruct is None:
+        # Maybe root itself is the biblStruct
+        local = root.tag.split("}")[-1] if "}" in root.tag else root.tag
+        if local == "biblStruct":
+            biblstruct = root
+    if biblstruct is None:
+        return None
+
+    from ..models import Reference as _Ref
+    return _Ref(
+        num=0,  # caller sets the real number
+        doi=_extract_reference_doi(biblstruct),
+        title=_extract_reference_title(biblstruct),
+        authors=_extract_reference_authors(biblstruct),
+        journal=_extract_reference_journal(biblstruct),
+        year=_extract_reference_year(biblstruct),
+        volume=_extract_bibl_scope(biblstruct, "volume"),
+        issue=_extract_bibl_scope(biblstruct, "issue"),
+        pages=_extract_bibl_scope(biblstruct, "page"),
+    )
 
 
 def _get_text_with_citations(elem: etree._Element, ref_id_map: dict) -> str:

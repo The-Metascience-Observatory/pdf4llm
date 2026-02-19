@@ -11,7 +11,7 @@ Or:
 from setuptools import setup, find_packages
 
 setup(
-    name="pdf2mdjson",
+    name="pdf4llm",
     version="1.0.0",
     description="PDF-to-Markdown and JSON converter optimized for LLM analysis of scientific papers",
     author="Metascience Observatory",
@@ -26,6 +26,7 @@ setup(
         "tqdm>=4.66.0",
         "click>=8.0.0",
         "Pillow>=10.0.0",  # For chart image processing
+        "pytesseract>=0.3.10",  # OCR fallback via Tesseract
     ],
     extras_require={
         "dev": [
@@ -37,7 +38,7 @@ setup(
     },
     entry_points={
         "console_scripts": [
-            "pdf2mdjson=pdf2mdjson.cli:main",
+            "pdf4llm=pdf4llm.cli:main",
         ],
     },
     classifiers=[
