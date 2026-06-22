@@ -39,7 +39,6 @@ Each converted PDF produces a subfolder named by its file stem:
 ├── body.md               # main text with sections and inline tables (docling)
 ├── references.json       # structured [{authors, title, journal, year, doi, …}, …] (GROBID)
 ├── references.md         # references section as prose markdown (docling)
-├── tables.md             # extracted tables (when tables are present)
 └── provenance.json       # per-field attribution: which extractor produced which file
 ```
 
@@ -565,6 +564,8 @@ Treat these records as best-effort. Downstream consumers (e.g. `extract.py` in `
 
 ```
 pdf4llm/
+├── launcher.py               # console-script entry; manages an isolated venv, re-execs cli.py
+├── install_grobid.py         # auto-install/start GROBID via Docker (pdf4llm-install-grobid)
 ├── cli.py                    # Click CLI entry points (convert, batch, health-check)
 ├── config.py                 # Config dataclass
 ├── models.py                 # DocumentModel and related Pydantic models
@@ -580,7 +581,7 @@ pdf4llm/
 │   ├── pymupdf4llm_ext.py    # pymupdf4llm integration (last-resort tier after marker)
 │   └── doi_lookup.py         # DOI→title lookup via Crossref/DataCite/Unpaywall/S2/OpenAlex
 └── renderers/
-    ├── markdown.py           # abstract.md, body.md, tables.md renderers
+    ├── markdown.py           # abstract.md and body.md renderers (tables render inline in body.md)
     └── json_output.py        # references.json and full-document JSON
 ```
 
