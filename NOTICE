@@ -1,0 +1,151 @@
+pdf4llm
+Copyright (C) 2024-2026 The Metascience Observatory
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published
+by the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version. See the LICENSE file for the full
+license text, or <https://www.gnu.org/licenses/agpl-3.0.txt>.
+
+================================================================================
+
+pdf4llm incorporates the following third-party software. Each is used under
+its own license; no source code has been copied from any of these projects —
+they are used via their public APIs as distributed. This NOTICE file exists
+to document the dependency chain and the copyleft obligations it creates.
+
+--------------------------------------------------------------------------------
+PyMuPDF (fitz) — https://pymupdf.readthedocs.io/
+Copyright (C) 2016-2024 Artifex Software, Inc.
+
+Dual-licensed under GNU AFFERO GENERAL PUBLIC LICENSE Version 3 (AGPL-3.0)
+or a commercial license from Artifex Software. pdf4llm uses PyMuPDF under
+the AGPL-3.0 terms, and this is the primary reason pdf4llm itself must be
+distributed under AGPL-3.0-or-later.
+
+Used directly in:
+  - pdf4llm/extractors/fast.py         (PyMuPDF text extraction)
+  - pdf4llm/extractors/ocr_fallback.py (PyMuPDF page rendering for Tesseract)
+  - pdf4llm/extractors/charts.py       (PyMuPDF figure extraction)
+  - pdf4llm/extractors/pymupdf4llm_ext.py (PyMuPDF PDF metadata access)
+  - pdf4llm/pipeline.py                (PyMuPDF page count helper)
+
+--------------------------------------------------------------------------------
+pymupdf4llm — https://pymupdf.readthedocs.io/en/latest/pymupdf4llm/
+Copyright (C) 2024 Artifex Software, Inc.
+
+Dual-licensed under GNU AFFERO GENERAL PUBLIC LICENSE Version 3 (AGPL-3.0)
+or a commercial license from Artifex Software. pdf4llm uses pymupdf4llm
+under the AGPL-3.0 terms.
+
+Used directly in:
+  - pdf4llm/extractors/pymupdf4llm_ext.py (last-resort markdown extraction tier)
+
+--------------------------------------------------------------------------------
+marker-pdf — https://github.com/VikParuchuri/marker
+Copyright (C) 2024 Vik Paruchuri / Datalab, Inc.
+
+Licensed under GPL-3.0-or-later. Used only as an optional fallback tier when
+both GROBID and docling have failed — loaded lazily via a try/except ImportError
+guard. If marker-pdf is not installed, pdf4llm gracefully skips this tier and
+proceeds to the pymupdf4llm last-resort tier.
+
+GPL-3.0 is compatible with AGPL-3.0 under AGPL §13, so marker-pdf integration
+does not add new copyleft constraints beyond those already imposed by PyMuPDF.
+
+Used (lazily) in:
+  - pdf4llm/extractors/marker_ext.py (marker fallback tier)
+
+--------------------------------------------------------------------------------
+docling — https://github.com/docling-project/docling
+Copyright (C) 2024 IBM Corporation.
+
+Licensed under MIT. Optional dependency, used for the parallel GROBID+docling
+merge path (the default extraction mode). If docling is not installed, pdf4llm
+falls back to sequential GROBID-only extraction. The MIT license imposes no
+additional constraints.
+
+Used (lazily) in:
+  - pdf4llm/pipeline.py (_extract_with_docling, _patch_docling_hyperlink_uri)
+
+--------------------------------------------------------------------------------
+GROBID — https://github.com/kermitt2/grobid
+Copyright (C) 2008-2024 The contributors.
+
+Licensed under Apache License 2.0. GROBID runs as a separate HTTP service
+(via auto-start from a sibling source checkout or Docker) and is accessed
+over HTTP by pdf4llm. It is not linked into the pdf4llm process. Apache-2.0
+imposes no additional constraints.
+
+Used via HTTP API in:
+  - pdf4llm/extractors/grobid.py (GrobidClient)
+
+--------------------------------------------------------------------------------
+DeLFT — https://github.com/kermitt2/delft
+Copyright (C) 2018-2024 The contributors.
+
+Licensed under Apache License 2.0. DeLFT is loaded by GROBID at GROBID
+runtime (via a JEP Python-in-Java bridge) and is never imported by pdf4llm
+directly. No linkage obligations for pdf4llm.
+
+--------------------------------------------------------------------------------
+pdfplumber — https://github.com/jsvine/pdfplumber
+Copyright (C) 2016 Jeremy Singer-Vine.
+
+Licensed under MIT. Used for table quality assessment and the Fast mode
+text extraction path.
+
+--------------------------------------------------------------------------------
+lxml — https://lxml.de/
+Copyright (C) 2004 Infrae. All rights reserved.
+
+Licensed under BSD-3-Clause. Used for TEI XML parsing in the GROBID extractor.
+
+--------------------------------------------------------------------------------
+pydantic — https://docs.pydantic.dev/
+Copyright (C) 2017 to present Pydantic Services Inc. and individual contributors.
+
+Licensed under MIT. Used for all structured data models in pdf4llm.
+
+--------------------------------------------------------------------------------
+click — https://click.palletsprojects.com/
+Copyright (C) 2014 Pallets.
+
+Licensed under BSD-3-Clause. Used for the CLI.
+
+--------------------------------------------------------------------------------
+requests — https://requests.readthedocs.io/
+Copyright (C) 2019 Kenneth Reitz.
+
+Licensed under Apache License 2.0. Used for HTTP calls to GROBID.
+
+--------------------------------------------------------------------------------
+tqdm — https://tqdm.github.io/
+Copyright (C) 2013 noamraph.
+
+Licensed under MPL-2.0 AND MIT. Used for batch-processing progress bars.
+MPL-2.0 is weakly copyleft at the file level only — no project-level constraint.
+
+--------------------------------------------------------------------------------
+Pillow — https://python-pillow.org/
+Copyright (C) 1997-2011 Secret Labs AB; 1995-2011 Fredrik Lundh and contributors.
+
+Licensed under HPND (Historical Permission Notice and Disclaimer). Used via
+pytesseract and PyMuPDF for image handling in the OCR fallback path.
+
+--------------------------------------------------------------------------------
+pytesseract — https://github.com/madmaze/pytesseract
+Copyright (C) 2017 Matthias A. Lee.
+
+Licensed under Apache License 2.0. Used for the Tesseract OCR fallback tier.
+
+--------------------------------------------------------------------------------
+Tesseract OCR — https://github.com/tesseract-ocr/tesseract
+Copyright (C) 2006 Google Inc. / contributors.
+
+Licensed under Apache License 2.0. Tesseract runs as a separate system binary
+and is invoked via the pytesseract subprocess wrapper.
+
+--------------------------------------------------------------------------------
+For the complete AGPL-3.0 license text, see the LICENSE file in this
+distribution, or visit <https://www.gnu.org/licenses/agpl-3.0.txt>.

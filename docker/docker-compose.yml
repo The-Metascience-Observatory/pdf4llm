@@ -6,12 +6,11 @@ services:
   grobid-delft:
     image: grobid/grobid:0.8.2-full
     container_name: grobid-delft
-    ports:
-      - "8070:8070"
+    network_mode: host
     environment:
       - JAVA_OPTS=-Xmx6g -Xms2g
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8070/api/isalive"]
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8070/api/isalive', timeout=5)\""]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -23,12 +22,11 @@ services:
   grobid-crf:
     image: grobid/grobid:0.8.2-crf
     container_name: grobid-crf
-    ports:
-      - "8070:8070"
+    network_mode: host
     environment:
       - JAVA_OPTS=-Xmx4g -Xms2g
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8070/api/isalive"]
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8070/api/isalive', timeout=5)\""]
       interval: 30s
       timeout: 10s
       retries: 3

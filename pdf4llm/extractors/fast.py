@@ -17,8 +17,16 @@ from ..models import (
     ExtractionMetadata
 )
 from .tables import assess_table_quality
+from .doi_lookup import fetch_title_from_doi
 
 logger = logging.getLogger(__name__)
+
+# Reference-section heading patterns (shared with marker_ext, pymupdf4llm_ext, pipeline)
+REF_HEADING_PATTERNS = [
+    r"(?im)^\s{0,3}#{1,6}\s*references\s*$",
+    r"(?im)^\s{0,3}#{1,6}\s*bibliography\s*$",
+    r"(?im)^\s{0,3}#{1,6}\s*works\s+cited\s*$",
+]
 
 
 def extract_fast(pdf_path: Path, config: Optional[Config] = None) -> DocumentModel:
@@ -61,7 +69,7 @@ def extract_fast(pdf_path: Path, config: Optional[Config] = None) -> DocumentMod
         # Extract title (font-based first, then DOI lookup as fallback)
         title = _extract_title_from_text(full_text, doc)
         if not title or title == "Untitled" or len(title) > 200 or _is_bad_title(title):
-            doi_title = _fetch_title_from_doi(doi)
+            doi_title = fetch_title_from_doi(doi)
             if doi_title:
                 title = doi_title
 
@@ -144,7 +152,7 @@ TITLE_ARTIFACT_PATTERNS = [
     r"^Letter\s+to",
     r"^www\.",                             # website URLs
     r"^\(\d+\)$",                          # bare numbers in parens
-    r"^[A-Z]+\s*\d+",                     # journal codes like "J123"
+    r"^[A-Z]+\s*\d+$",                    # journal codes like "J123" (must fill whole title)
     r"^Page\s+\d+",                        # page numbers
     r"^Cite\s+this",                       # citation prompts
     r"^\d+\s*[-–]\s*\d+$",               # page ranges
@@ -461,32 +469,6 @@ def _is_bad_title(title: str) -> bool:
     return False
 
 
-def _fetch_title_from_doi(doi: Optional[str]) -> Optional[str]:
-    """
-    Fetch the paper title from its DOI via Crossref API.
-
-    Fast, reliable fallback when font-based title extraction fails
-    (e.g. PNAS papers where drop caps confuse font-size heuristics).
-    """
-    if not doi:
-        return None
-
-    try:
-        import requests
-        resp = requests.get(
-            f"https://api.crossref.org/works/{doi}",
-            headers={"User-Agent": "pdf4llm/1.0"},
-            timeout=10,
-        )
-        if resp.status_code == 200:
-            title = (resp.json().get("message", {}).get("title") or [None])[0]
-            if title and len(title) > 10:
-                return title
-    except Exception:
-        pass
-
-    return None
-
 
 def _extract_sections_from_text(text: str, title: str = "") -> List[Section]:
     """
@@ -736,33 +718,44 @@ def _extract_doi_from_filename(pdf_path: Path) -> Optional[str]:
     """
     Extract DOI from filename convention: 10.XXXX--suffix.pdf
 
-    Many pipelines encode the DOI in the filename by replacing '/' with '--'.
-    For example: 10.1002--jnr.22753.pdf -> 10.1002/jnr.22753
-    Also handles spurious leading digit: 110.1002--smj.2585.pdf -> 10.1002/smj.2585
+    Many pipelines encode the DOI in the filename by replacing ALL '/' with
+    '--'. Multi-segment DOIs (e.g. `10.1093/rheumatology/kew394`) therefore
+    appear in filenames as `10.1093--rheumatology--kew394.pdf`, and every
+    `--` must be replaced with `/` on the way back — not just the first one.
+
+    Examples:
+      - 10.1002--jnr.22753.pdf               -> 10.1002/jnr.22753
+      - 10.1093--rheumatology--kew394.pdf    -> 10.1093/rheumatology/kew394
+      - 110.1002--smj.2585.pdf               -> 10.1002/smj.2585 (spurious leading digit)
     """
     stem = pdf_path.stem
-    # Try exact match first
-    match = re.match(r"^(10\.\d{4,})--(.+)$", stem)
-    if match:
-        return f"{match.group(1)}/{match.group(2)}"
-    # Handle spurious leading digits (e.g. 110.1002--x -> 10.1002/x)
+    # Match leading DOI prefix (optionally after spurious leading digits),
+    # then replace ALL remaining `--` in the suffix with `/`.
     match = re.match(r"^\d*(10\.\d{4,})--(.+)$", stem)
     if match:
-        return f"{match.group(1)}/{match.group(2)}"
+        suffix = match.group(2).replace("--", "/")
+        return f"{match.group(1)}/{suffix}"
     return None
 
 
 def _extract_doi_from_reference(text: str) -> Optional[str]:
-    """Extract DOI from a reference entry."""
+    """Extract DOI from a reference entry.
+
+    NOTE: earlier versions of this function used `[10]\\.` (a character class
+    matching a single char from {1, 0}) instead of the literal `10\\.`. That
+    was a silent bug — no real DOI starts with just "1." or "0.", so the
+    function returned None on every input. Fixed to use the literal "10."
+    prefix like `_extract_doi_from_text` does.
+    """
     patterns = [
-        r"(?i)doi[:\s]+([10]\.\d{4,}/[^\s\]]+)",
-        r"(?i)https?://doi\.org/([10]\.\d{4,}/[^\s\]]+)",
+        r"(?i)doi[:\s]+\s*(10\.\d{4,}/[^\s,;\"'<>\]]+)",
+        r"(?i)https?://(?:dx\.)?doi\.org/(10\.\d{4,}/[^\s,;\"'<>\]]+)",
     ]
 
     for pattern in patterns:
         match = re.search(pattern, text)
         if match:
-            doi = match.group(1).rstrip(".,;)")
+            doi = match.group(1).rstrip(".,;:)")
             return doi
 
     return None

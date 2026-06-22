@@ -11,6 +11,7 @@ This module handles:
 import logging
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from pathlib import Path
 from typing import Optional, List, Tuple
 from lxml import etree
@@ -113,58 +114,49 @@ class GrobidClient:
             raise GrobidError(f"PDF file not found: {pdf_path}")
 
         url = f"{self.base_url}/api/processFulltextDocument"
+        timeout = self.config.grobid_timeout
 
-        last_error = None
-        for attempt in range(self.config.grobid_retry_count):
-            try:
-                with open(pdf_path, "rb") as pdf_file:
-                    response = requests.post(
-                        url,
-                        files={"input": (pdf_path.name, pdf_file, "application/pdf")},
-                        data={
-                            "consolidateHeader": "1",
-                            "consolidateCitations": "0",
-                            "includeRawCitations": "1",
-                            "teiCoordinates": "persName,figure,ref,formula,biblStruct,s,head",
-                        },
-                        timeout=self.config.grobid_timeout
-                    )
-
-                if response.status_code == 200:
-                    return response.text
-                elif response.status_code == 503:
-                    # Server busy, wait and retry
-                    logger.warning(f"GROBID busy, retrying in {self.config.grobid_retry_delay}s...")
-                    time.sleep(self.config.grobid_retry_delay * (attempt + 1))
-                    continue
-                else:
-                    error_text = response.text[:300]
-                    if "[NO_BLOCKS]" in response.text:
-                        raise GrobidScannedPdfError(
-                            f"GROBID returned status {response.status_code}: {error_text}"
-                        )
-                    raise GrobidError(
-                        f"GROBID returned status {response.status_code}: {error_text}"
-                    )
-
-            except requests.Timeout:
-                last_error = GrobidError(f"GROBID timeout after {self.config.grobid_timeout}s")
-                logger.warning(f"GROBID timeout, attempt {attempt + 1}/{self.config.grobid_retry_count}")
-            except requests.ConnectionError:
-                # GROBID process has died - likely out of memory
-                raise GrobidError(
-                    "GROBID server has crashed (connection refused). "
-                    "This usually means GROBID ran out of memory. "
-                    "Try reducing --workers (e.g. --workers 2) or restarting GROBID with more memory (-Xmx8g)."
+        def _do_request():
+            with open(pdf_path, "rb") as pdf_file:
+                return requests.post(
+                    url,
+                    files={"input": (pdf_path.name, pdf_file, "application/pdf")},
+                    data={
+                        "consolidateHeader": "1",
+                        "consolidateCitations": "0",
+                        "includeRawCitations": "1",
+                        "teiCoordinates": "persName,figure,ref,formula,biblStruct,s,head",
+                    },
+                    timeout=None,  # no socket timeout; hard timeout below
                 )
-            except requests.RequestException as e:
-                last_error = GrobidError(f"GROBID request failed: {e}")
-                logger.warning(f"GROBID request error: {e}")
 
-            if attempt < self.config.grobid_retry_count - 1:
-                time.sleep(self.config.grobid_retry_delay)
+        # Hard wall-clock timeout using a thread
+        try:
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(_do_request)
+                response = future.result(timeout=timeout)
+        except FuturesTimeoutError:
+            raise GrobidError(f"GROBID timeout after {timeout}s for {pdf_path.name}")
+        except requests.ConnectionError:
+            raise GrobidError(
+                "GROBID server has crashed (connection refused). "
+                "This usually means GROBID ran out of memory. "
+                "Try reducing --workers (e.g. --workers 2) or restarting GROBID with more memory (-Xmx8g)."
+            )
+        except requests.RequestException as e:
+            raise GrobidError(f"GROBID request failed: {e}")
 
-        raise last_error or GrobidError("GROBID processing failed after retries")
+        if response.status_code == 200:
+            return response.text
+        else:
+            error_text = response.text[:300]
+            if "[NO_BLOCKS]" in response.text:
+                raise GrobidScannedPdfError(
+                    f"GROBID returned status {response.status_code}: {error_text}"
+                )
+            raise GrobidError(
+                f"GROBID returned status {response.status_code}: {error_text}"
+            )
 
 
 def extract_with_grobid(
@@ -225,6 +217,9 @@ def parse_tei_xml(
     # Extract title
     title = _extract_title(root)
 
+    # Extract publication year
+    year = _extract_document_year(root)
+
     # Extract references FIRST to build citation map (CRITICAL for DOI extraction)
     references, ref_id_map = _extract_references(root)
 
@@ -254,6 +249,7 @@ def parse_tei_xml(
         metadata=metadata,
         doi=doi,
         title=title,
+        year=year,
         abstract=abstract,
         sections=sections,
         tables=tables,
@@ -277,6 +273,30 @@ def _extract_document_doi(root: etree._Element) -> Optional[str]:
     return None
 
 
+def _extract_document_year(root: etree._Element) -> Optional[int]:
+    """Extract publication year from TEI header."""
+    # Try <date type="published" when="YYYY..."> in publicationStmt
+    for date_elem in root.findall(".//tei:teiHeader//tei:date", TEI_NS):
+        date_type = date_elem.get("type", "")
+        when = date_elem.get("when", "")
+        if date_type in ("published", "publication", "issued") and when:
+            try:
+                return int(when[:4])
+            except (ValueError, IndexError):
+                pass
+    # Fallback: any <date when="YYYY..."> in the header
+    for date_elem in root.findall(".//tei:teiHeader//tei:date", TEI_NS):
+        when = date_elem.get("when", "")
+        if when:
+            try:
+                yr = int(when[:4])
+                if 1500 < yr < 2100:
+                    return yr
+            except (ValueError, IndexError):
+                pass
+    return None
+
+
 def _extract_title(root: etree._Element) -> str:
     """Extract document title."""
     title_elem = root.find(".//tei:titleStmt/tei:title", TEI_NS)
@@ -288,7 +308,7 @@ def _extract_title(root: etree._Element) -> str:
     if title_elem is not None:
         return _get_text_content(title_elem).strip()
 
-    return "Untitled"
+    return ""
 
 
 def _extract_abstract(root: etree._Element, ref_id_map: Optional[dict] = None) -> Optional[str]:
@@ -728,7 +748,9 @@ def _parse_citation_tei_fragment(tei_text: str) -> Optional[Reference]:
 
     # Year
     year = None
-    date = bs.find(".//date[@type='published']") or bs.find(".//date")
+    date = bs.find(".//date[@type='published']")
+    if date is None:
+        date = bs.find(".//date")
     if date is not None:
         when = date.get("when", "")
         m = re.match(r"(\d{4})", when or _text(date))

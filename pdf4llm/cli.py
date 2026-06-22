@@ -2,11 +2,11 @@
 Command-line interface for PDF-to-Markdown converter.
 
 Usage:
-    pdf2md convert paper.pdf -o output/
-    pdf2md batch ./pdfs/ -o ./markdown/ --workers 4
-    pdf2md batch ./pdfs/ -o ./markdown/ --mode fast
-    pdf2md batch ./pdfs/ -o ./markdown/ --resume
-    pdf2md health-check
+    pdf4llm convert paper.pdf -o output/
+    pdf4llm batch ./pdfs/ -o ./markdown/ --workers 4
+    pdf4llm batch ./pdfs/ -o ./markdown/ --mode fast
+    pdf4llm batch ./pdfs/ -o ./markdown/ --resume
+    pdf4llm health-check
 """
 
 import logging
@@ -22,11 +22,10 @@ import click
 import requests
 
 from .config import Config, ExtractionMode
-from .pipeline import convert_single, BatchProcessor, check_grobid_health
+from .pipeline import convert_single, BatchProcessor, check_grobid_health, GROBID_CRASH_MARKERS
 
-# Default GROBID source directory (sibling of pdf_to_markdown_and_json package)
+# Default GROBID source directory (sibling of pdf4llm package)
 _DEFAULT_GROBID_DIR = Path(__file__).resolve().parent.parent.parent / "grobid"
-_GROBID_CRASH_MARKERS = ("out of memory", "crashed", "connection refused")
 
 
 def _find_grobid_dir(grobid_home: str = None) -> Path:
@@ -161,6 +160,7 @@ def _start_grobid(grobid_dir: Path, port: int = 8070, run_without_delft: bool = 
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
+            start_new_session=True,  # New process group → we can SIGKILL the whole tree on Ctrl+C
         )
         return proc, True
     else:
@@ -195,6 +195,7 @@ def _start_grobid(grobid_dir: Path, port: int = 8070, run_without_delft: bool = 
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
+            start_new_session=True,  # New process group → clean whole-tree kill on Ctrl+C
         )
         return proc, False
 
@@ -248,15 +249,55 @@ def _wait_for_grobid(url: str, timeout: int = 120) -> bool:
 
 
 def _stop_grobid(proc: subprocess.Popen):
-    """Gracefully stop the GROBID process."""
-    if proc and proc.poll() is None:
-        click.echo("Stopping GROBID...")
-        proc.send_signal(signal.SIGTERM)
+    """Stop the GROBID process tree quickly and forcefully.
+
+    Sends SIGTERM to the entire process group (because Gradle may have spawned
+    a Java child), waits up to 3 seconds, then SIGKILLs if still alive.
+    Required because DeLFT's JEP bridge can deadlock on graceful shutdown.
+    """
+    if not proc or proc.poll() is not None:
+        return
+
+    click.echo("Stopping GROBID...")
+    try:
+        # Kill the whole process group (negative pid = process group)
+        pgid = os.getpgid(proc.pid)
         try:
-            proc.wait(timeout=15)
+            os.killpg(pgid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
+        try:
+            proc.wait(timeout=3)
+            click.echo("  GROBID stopped (SIGTERM)")
+            return
+        except subprocess.TimeoutExpired:
+            pass
+
+        # SIGTERM didn't work in 3s, force-kill the whole group
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            proc.wait(timeout=2)
+            click.echo("  GROBID stopped (SIGKILL)")
+        except subprocess.TimeoutExpired:
+            click.secho("  WARNING: GROBID did not exit after SIGKILL", fg="yellow")
+    except Exception as e:
+        # Fall back to single-process kill if process group machinery fails
+        try:
+            proc.send_signal(signal.SIGTERM)
+            proc.wait(timeout=3)
         except subprocess.TimeoutExpired:
             proc.kill()
-            proc.wait()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+        except Exception:
+            pass
+        click.secho(f"  _stop_grobid fallback path used: {e}", fg="yellow")
 
 
 def setup_logging(verbose: bool = False):
@@ -282,7 +323,7 @@ def _check_tesseract():
 def _is_grobid_crash_text(message: str) -> bool:
     """Detect fatal GROBID crash/OOM messages."""
     msg = message.lower()
-    return any(marker in msg for marker in _GROBID_CRASH_MARKERS)
+    return any(marker in msg for marker in GROBID_CRASH_MARKERS)
 
 
 def _print_batch_error(error: Exception):
@@ -315,8 +356,12 @@ def cli():
 @click.option("-o", "--output", "output_dir", type=click.Path(),
               default=".", help="Output directory")
 @click.option("--mode", type=click.Choice(["full-grobid", "hybrid", "fast"]),
-              default="full-grobid", help="Extraction mode")
-@click.option("--grobid-url", default="http://localhost:8070",
+              default="full-grobid", show_default=True,
+              help="Extraction mode. 'full-grobid' (default, highest quality) runs "
+                   "GROBID + docling in parallel and merges best-of-each. "
+                   "'hybrid' uses fast PyMuPDF with selective GROBID fallback. "
+                   "'fast' is PyMuPDF-only (no GROBID, lowest quality).")
+@click.option("--grobid-url", default="http://127.0.0.1:8070",
               help="GROBID server URL")
 @click.option("--no-json", is_flag=True, help="Don't output JSON file")
 @click.option("--save-tei", is_flag=True, help="Save raw TEI XML")
@@ -338,18 +383,46 @@ def cli():
               help="Move the input PDF into the output folder after successful processing")
 @click.option("--run-without-delft", is_flag=True,
               help="Allow running in CRF-only mode when DeLFT is unavailable (lower accuracy)")
+@click.option("--extract-abstract-only", is_flag=True,
+              help="Only extract abstracts. Saves as {DOI}_abstract.md (no subfolders)")
+@click.option("--noocr", is_flag=True,
+              help="Disable Tesseract OCR fallback (skip PDFs that fail GROBID extraction)")
+@click.option("--no-crossref", "no_crossref", is_flag=True,
+              help="Disable CrossRef DOI enrichment for references with missing DOIs.")
+@click.option("--docling-only", "use_docling", is_flag=True,
+              help="Use docling alone, bypassing GROBID entirely. "
+                   "(Previously --use-docling / --docling.) Use this when you don't "
+                   "want parallel GROBID extraction at all.")
+@click.option("--no-parallel", is_flag=True,
+              help="Disable parallel GROBID+docling mode. Falls back to sequential "
+                   "single-extractor behavior. Default is parallel (docling + GROBID "
+                   "both run per PDF, outputs merged).")
+@click.option("--no-marker-fallback", is_flag=True,
+              help="Disable the marker-pdf final fallback tier (used when both GROBID "
+                   "and docling fail). Default: enabled.")
+@click.option("--no-pymupdf-fallback", is_flag=True,
+              help="Disable the pymupdf4llm last-resort fallback tier (runs after "
+                   "marker-pdf fails or is disabled). Fast, pure Python, no ML, "
+                   "produces flat markdown as a final safety net. Default: enabled.")
+@click.option("--docling-gpu", is_flag=True,
+              help="Enable CUDA GPU acceleration for docling. (For batch, this is auto-enabled "
+                   "when --workers >= 2 and CUDA is available.)")
+@click.option("--no-docling-gpu", is_flag=True,
+              help="Force docling off of GPU (CPU only). Opt-out for auto-enabled default.")
 @click.option("-v", "--verbose", is_flag=True, help="Verbose output")
 def convert(pdf_path, output_dir, mode, grobid_url, no_json, save_tei,
             extract_charts, chart_model, ollama_url, grobid_home, no_auto_grobid,
-            use_docker, docker_mode, movepdf, run_without_delft, verbose):
+            use_docker, docker_mode, movepdf, run_without_delft, extract_abstract_only, noocr,
+            no_crossref, use_docling, no_parallel, no_marker_fallback, no_pymupdf_fallback,
+            docling_gpu, no_docling_gpu, verbose):
     """Convert a single PDF to Markdown.
 
     GROBID is auto-started with DeLFT (highest accuracy) if not already running.
     Use --no-auto-grobid to disable auto-start.
 
     Example:
-        pdf2md convert paper.pdf -o output/
-        pdf2md convert paper.pdf -o output/ --movepdf
+        pdf4llm convert paper.pdf -o output/
+        pdf4llm convert paper.pdf -o output/ --movepdf
     """
     setup_logging(verbose)
     _check_tesseract()
@@ -364,6 +437,12 @@ def convert(pdf_path, output_dir, mode, grobid_url, no_json, save_tei,
             sys.exit(1)
         click.echo(f"Chart extraction enabled (model: {chart_model or 'llava:13b'})")
 
+    # --no-docling-gpu is an explicit override that forces CPU even if
+    # --docling-gpu was passed. --docling-gpu on its own enables GPU docling
+    # but no longer forces --docling-only (parallel GROBID+docling still runs).
+    if no_docling_gpu:
+        docling_gpu = False
+
     config = Config(
         mode=ExtractionMode.from_string(mode),
         grobid_url=grobid_url,
@@ -372,125 +451,117 @@ def convert(pdf_path, output_dir, mode, grobid_url, no_json, save_tei,
         extract_charts=extract_charts,
         chart_model=chart_model,
         ollama_url=ollama_url,
+        abstract_only=extract_abstract_only,
+        no_ocr=noocr,
+        crossref_enrich_threshold=0.0 if no_crossref else 0.5,
+        use_docling=use_docling,
+        docling_use_gpu=docling_gpu,
+        parallel_extraction=not no_parallel,
+        use_marker_fallback=not no_marker_fallback,
+        use_pymupdf_fallback=not no_pymupdf_fallback,
         verbose=verbose,
     )
-
-    # Handle Docker GROBID startup if requested
-    if use_docker and config.requires_grobid():
-        docker_dir = Path(__file__).parent.parent / "docker"
-        docker_compose = docker_dir / "docker-compose.yml"
-
-        if not docker_compose.exists():
-            click.secho(
-                f"Docker config not found at {docker_compose}\n"
-                "Run from pdf4llm root directory or use --grobid-url to connect to existing GROBID",
-                fg="red"
-            )
-            sys.exit(1)
-
-        click.echo(f"Starting GROBID Docker ({docker_mode} mode)...")
-        try:
-            # Stop any existing containers
-            subprocess.run(
-                ["docker", "compose", "-f", str(docker_compose), "down"],
-                capture_output=True, check=False
-            )
-
-            # Start GROBID with selected profile
-            result = subprocess.run(
-                ["docker", "compose", "-f", str(docker_compose),
-                 "--profile", docker_mode, "up", "-d"],
-                check=True, capture_output=True, text=True
-            )
-
-            # Wait for readiness
-            click.echo("Waiting for GROBID to be ready...", nl=False)
-            if _wait_for_grobid(config.grobid_url, timeout=120):
-                click.secho(" OK", fg="green")
-
-                # Get version
-                from .extractors.grobid import GrobidClient
-                client = GrobidClient(config)
-                version = client.get_version()
-                if version:
-                    click.echo(f"GROBID version: {version}")
-                click.echo(f"Mode: {docker_mode} ({'DeLFT deep learning' if docker_mode == 'delft' else 'CRF-only (fastest)'})")
-            else:
-                click.secho(" TIMEOUT", fg="red")
-                subprocess.run(
-                    ["docker", "compose", "-f", str(docker_compose), "down"],
-                    capture_output=True, check=False
-                )
-                sys.exit(1)
-
-        except subprocess.CalledProcessError as e:
-            click.secho(
-                f"Failed to start GROBID Docker: {e.stderr if e.stderr else str(e)}",
-                fg="red"
-            )
-            sys.exit(1)
-        except FileNotFoundError:
-            click.secho(
-                "Docker or docker-compose not found. Please install Docker first.",
-                fg="red"
-            )
-            sys.exit(1)
-
-        # Skip normal GROBID startup logic
-        no_auto_grobid = True
 
     # GROBID lifecycle management
     grobid_proc = None
     using_delft = False
     grobid_dir = None
 
-    if config.requires_grobid() and not use_docker:
-        # Check DeLFT BEFORE pinging GROBID — catches already-running instances too
-        try:
-            grobid_dir = _find_grobid_dir(grobid_home)
-        except click.ClickException as e:
-            click.secho(f"\n{e.message}", fg="red")
-            sys.exit(1)
-        _require_delft(grobid_dir, run_without_delft)
+    if not use_docling:
+        # Handle Docker GROBID startup if requested
+        if use_docker and config.requires_grobid():
+            docker_dir = Path(__file__).parent.parent / "docker"
+            docker_compose = docker_dir / "docker-compose.yml"
 
-    if config.requires_grobid():
-        from .extractors.grobid import GrobidClient
-        click.echo(f"Checking GROBID at {config.grobid_url}...", nl=False)
-        client = GrobidClient(config)
-        already_running = client.is_alive(timeout=5)
+            if not docker_compose.exists():
+                click.secho(
+                    f"Docker config not found at {docker_compose}\n"
+                    "Run from pdf4llm root directory or use --grobid-url to connect to existing GROBID",
+                    fg="red"
+                )
+                sys.exit(1)
 
-        if already_running and no_auto_grobid:
-            # User manages GROBID externally; trust it and continue
-            click.secho(" OK (external)", fg="green")
-            click.secho("✓ DeLFT deep learning models: ACTIVE", fg="green", bold=True)
-            using_delft = True
-        elif no_auto_grobid:
-            click.secho(" NOT AVAILABLE", fg="red")
-            sys.exit(1)
-        else:
-            if already_running:
-                click.secho(" running — restarting with DeLFT", fg="yellow")
-                _kill_grobid_on_port(8070)
-            else:
-                click.secho(" not running", fg="yellow")
+            click.echo(f"Starting GROBID Docker ({docker_mode} mode)...")
             try:
-                grobid_proc, using_delft = _start_grobid(grobid_dir, run_without_delft=run_without_delft)
-                click.echo(f"Waiting for GROBID to be ready...", nl=False)
+                subprocess.run(
+                    ["docker", "compose", "-f", str(docker_compose), "down"],
+                    capture_output=True, check=False
+                )
+                result = subprocess.run(
+                    ["docker", "compose", "-f", str(docker_compose),
+                     "--profile", docker_mode, "up", "-d"],
+                    check=True, capture_output=True, text=True
+                )
+                click.echo("Waiting for GROBID to be ready...", nl=False)
                 if _wait_for_grobid(config.grobid_url, timeout=120):
                     click.secho(" OK", fg="green")
-                    if using_delft:
-                        click.secho("✓ DeLFT deep learning models: ACTIVE", fg="green", bold=True)
-                    else:
-                        click.secho("✗ DeLFT not active — running CRF-only mode", fg="yellow")
+                    from .extractors.grobid import GrobidClient
+                    client = GrobidClient(config)
+                    version = client.get_version()
+                    if version:
+                        click.echo(f"GROBID version: {version}")
+                    click.echo(f"Mode: {docker_mode} ({'DeLFT deep learning' if docker_mode == 'delft' else 'CRF-only (fastest)'})")
                 else:
                     click.secho(" TIMEOUT", fg="red")
-                    _stop_grobid(grobid_proc)
+                    subprocess.run(
+                        ["docker", "compose", "-f", str(docker_compose), "down"],
+                        capture_output=True, check=False
+                    )
                     sys.exit(1)
+            except subprocess.CalledProcessError as e:
+                click.secho(f"Failed to start GROBID Docker: {e.stderr if e.stderr else str(e)}", fg="red")
+                sys.exit(1)
+            except FileNotFoundError:
+                click.secho("Docker or docker-compose not found. Please install Docker first.", fg="red")
+                sys.exit(1)
+            no_auto_grobid = True
+
+        if config.requires_grobid() and not use_docker:
+            try:
+                grobid_dir = _find_grobid_dir(grobid_home)
             except click.ClickException as e:
                 click.secho(f"\n{e.message}", fg="red")
                 sys.exit(1)
+            _require_delft(grobid_dir, run_without_delft)
 
-    click.echo(f"Converting {pdf_path} (mode: {mode})")
+        if config.requires_grobid():
+            from .extractors.grobid import GrobidClient
+            click.echo(f"Checking GROBID at {config.grobid_url}...", nl=False)
+            client = GrobidClient(config)
+            already_running = client.is_alive(timeout=5)
+
+            if already_running and no_auto_grobid:
+                click.secho(" OK (external)", fg="green")
+                click.secho("✓ DeLFT deep learning models: ACTIVE", fg="green", bold=True)
+                using_delft = True
+            elif no_auto_grobid:
+                click.secho(" NOT AVAILABLE", fg="red")
+                sys.exit(1)
+            else:
+                if already_running:
+                    click.secho(" running — restarting with DeLFT", fg="yellow")
+                    _kill_grobid_on_port(8070)
+                else:
+                    click.secho(" not running", fg="yellow")
+                try:
+                    grobid_proc, using_delft = _start_grobid(grobid_dir, run_without_delft=run_without_delft)
+                    click.echo(f"Waiting for GROBID to be ready...", nl=False)
+                    if _wait_for_grobid(config.grobid_url, timeout=120):
+                        click.secho(" OK", fg="green")
+                        if using_delft:
+                            click.secho("✓ DeLFT deep learning models: ACTIVE", fg="green", bold=True)
+                        else:
+                            click.secho("✗ DeLFT not active — running CRF-only mode", fg="yellow")
+                    else:
+                        click.secho(" TIMEOUT", fg="red")
+                        _stop_grobid(grobid_proc)
+                        sys.exit(1)
+                except click.ClickException as e:
+                    click.secho(f"\n{e.message}", fg="red")
+                    sys.exit(1)
+
+    extraction_label = "docling" if use_docling else mode
+    click.echo(f"Converting {pdf_path} (mode: {extraction_label})")
 
     try:
         result = convert_single(
@@ -508,12 +579,20 @@ def convert(pdf_path, output_dir, mode, grobid_url, no_json, save_tei,
         # Use: docker compose -f docker/docker-compose.yml down to stop
 
     if result.status == "success":
-        click.secho(f"Success: {result.output_dir}/", fg="green")
-        # List files that actually exist
-        output_files = ["abstract.md", "body.md", "references.json"]
-        if (Path(result.output_dir) / "tables.md").exists():
-            output_files.append("tables.md")
-        click.echo("  " + ", ".join(output_files))
+        if config.abstract_only:
+            # In abstract-only mode, list the actual abstract file written
+            abstract_files = list(Path(result.output_dir).glob("*_abstract.md"))
+            if abstract_files:
+                click.secho(f"Success: {abstract_files[0].name}", fg="green")
+            else:
+                click.secho(f"Success: {result.output_dir}/", fg="green")
+        else:
+            click.secho(f"Success: {result.output_dir}/", fg="green")
+            # List files that actually exist
+            output_files = ["abstract.md", "body.md", "references.json"]
+            if (Path(result.output_dir) / "tables.md").exists():
+                output_files.append("tables.md")
+            click.echo("  " + ", ".join(output_files))
     elif result.status == "partial":
         click.secho(f"Partial success: {result.output_dir}/", fg="yellow")
         for warning in result.warnings:
@@ -541,8 +620,12 @@ def convert(pdf_path, output_dir, mode, grobid_url, no_json, save_tei,
 @click.option("-o", "--output", "output_dir", type=click.Path(),
               required=True, help="Output directory")
 @click.option("--mode", type=click.Choice(["full-grobid", "hybrid", "fast"]),
-              default="full-grobid", help="Extraction mode")
-@click.option("--grobid-url", default="http://localhost:8070",
+              default="full-grobid", show_default=True,
+              help="Extraction mode. 'full-grobid' (default, highest quality) runs "
+                   "GROBID + docling in parallel and merges best-of-each. "
+                   "'hybrid' uses fast PyMuPDF with selective GROBID fallback. "
+                   "'fast' is PyMuPDF-only (no GROBID, lowest quality).")
+@click.option("--grobid-url", default="http://127.0.0.1:8070",
               help="GROBID server URL")
 @click.option("--workers", type=int, default=None,
               help="Number of parallel workers (default: min(10, CPU count))")
@@ -567,27 +650,92 @@ def convert(pdf_path, output_dir, mode, grobid_url, no_json, save_tei,
               help="Move each input PDF into its output folder after successful processing")
 @click.option("--run-without-delft", is_flag=True,
               help="Allow running in CRF-only mode when DeLFT is unavailable (lower accuracy)")
+@click.option("--extract-abstract-only", is_flag=True,
+              help="Only extract abstracts. Saves as {DOI}_abstract.md (no subfolders)")
+@click.option("--noocr", is_flag=True,
+              help="Disable Tesseract OCR fallback (skip PDFs that fail GROBID extraction)")
+@click.option("--no-crossref", "no_crossref", is_flag=True,
+              help="Disable CrossRef DOI enrichment for references with missing DOIs.")
+@click.option("--docling-only", "use_docling", is_flag=True,
+              help="Use docling alone, bypassing GROBID entirely. "
+                   "(Previously --use-docling / --docling.) Use this when you don't "
+                   "want parallel GROBID extraction at all.")
+@click.option("--no-parallel", is_flag=True,
+              help="Disable parallel GROBID+docling mode. Falls back to sequential "
+                   "single-extractor behavior.")
+@click.option("--no-marker-fallback", is_flag=True,
+              help="Disable the marker-pdf final fallback tier (used when both GROBID "
+                   "and docling fail). Default: enabled.")
+@click.option("--no-pymupdf-fallback", is_flag=True,
+              help="Disable the pymupdf4llm last-resort fallback tier (runs after "
+                   "marker-pdf fails or is disabled). Fast, pure Python, no ML, "
+                   "produces flat markdown as a final safety net. Default: enabled.")
+@click.option("--docling-gpu", is_flag=True,
+              help="Force docling GPU acceleration on. Default: auto-on when --workers >= 2 "
+                   "and CUDA is available (one worker uses GPU, the other runs docling on CPU).")
+@click.option("--no-docling-gpu", is_flag=True,
+              help="Opt out of the auto-enabled docling GPU default. Forces CPU for all docling workers.")
+@click.option("--gpu-slots", type=int, default=1, show_default=True,
+              help="Number of concurrent docling workers that may use GPU simultaneously. "
+                   "Default 1 (one GPU lane, rest on CPU). With --workers 4 --gpu-slots 2, "
+                   "two workers run docling on CUDA and two run on CPU.")
 @click.option("-v", "--verbose", is_flag=True, help="Verbose output")
 def batch(input_dir, output_dir, mode, grobid_url, workers, timeout, skip_existing,
-          resume, checkpoint, no_json, grobid_home, no_auto_grobid, use_docker, docker_mode, movepdf, run_without_delft, verbose):
+          resume, checkpoint, no_json, grobid_home, no_auto_grobid, use_docker, docker_mode, movepdf, run_without_delft, extract_abstract_only, noocr, no_crossref, use_docling, no_parallel, no_marker_fallback, no_pymupdf_fallback, docling_gpu, no_docling_gpu, gpu_slots, verbose):
     """Convert a folder of PDFs to Markdown.
 
     GROBID is auto-started with DeLFT (highest accuracy) if not already running.
     Use --no-auto-grobid to disable auto-start.
 
     Example:
-        pdf2md batch ./pdfs/ -o ./markdown/ --workers 4
-        pdf2md batch ./pdfs/ -o ./markdown/ --resume
-        pdf2md batch ./pdfs/ -o ./markdown/ --movepdf
+        pdf4llm batch ./pdfs/ -o ./markdown/ --workers 4
+        pdf4llm batch ./pdfs/ -o ./markdown/ --resume
+        pdf4llm batch ./pdfs/ -o ./markdown/ --movepdf
     """
     setup_logging(verbose)
-    _check_tesseract()
+
+    # Docling GPU default: auto-enable when --workers >= 2 and CUDA is available,
+    # unless the user explicitly opted out with --no-docling-gpu. The _GPU_SLOT
+    # semaphore in pipeline.py then gives one concurrent docling thread the GPU
+    # while the other runs on CPU, so the 5090 isn't idle during parallel batch
+    # extraction. (--docling-gpu still works as an explicit force-on.)
+    if no_docling_gpu:
+        docling_gpu = False
+    elif not docling_gpu and (workers is None or workers >= 2):
+        try:
+            import torch
+            if torch.cuda.is_available():
+                docling_gpu = True
+                click.secho(
+                    "✓ Auto-enabled docling GPU (parallel workers + CUDA available; "
+                    "pass --no-docling-gpu to disable)",
+                    fg="cyan",
+                )
+        except Exception:
+            pass
+
+    # Propagate gpu_slots to pipeline before any worker threads start.
+    # pipeline._get_gpu_slot() reads this env var on first call (lazy init),
+    # so setting it here — before the ThreadPoolExecutor is created — guarantees
+    # the right semaphore permit count for the whole batch run.
+    os.environ["PDF4LLM_GPU_SLOTS"] = str(max(1, gpu_slots))
+
+    if not use_docling:
+        _check_tesseract()
 
     config_kwargs = dict(
         mode=ExtractionMode.from_string(mode),
         grobid_url=grobid_url,
         grobid_timeout=timeout,
         output_json=not no_json,
+        abstract_only=extract_abstract_only,
+        no_ocr=noocr,
+        crossref_enrich_threshold=0.0 if no_crossref else 0.5,
+        use_docling=use_docling,
+        docling_use_gpu=docling_gpu,
+        parallel_extraction=not no_parallel,
+        use_marker_fallback=not no_marker_fallback,
+        use_pymupdf_fallback=not no_pymupdf_fallback,
         verbose=verbose,
     )
     if workers is not None:
@@ -599,9 +747,10 @@ def batch(input_dir, output_dir, mode, grobid_url, workers, timeout, skip_existi
     if checkpoint:
         checkpoint_file = Path(checkpoint)
     elif resume:
-        checkpoint_file = Path(output_dir) / ".pdf2md_checkpoint.json"
+        checkpoint_file = Path(output_dir) / ".pdf4llm_checkpoint.json"
 
-    click.echo(f"Batch conversion (mode: {mode}, workers: {config.workers}, timeout: {timeout}s)")
+    extraction_label = "docling" if use_docling else mode
+    click.echo(f"Batch conversion (mode: {extraction_label}, workers: {config.workers}, timeout: {timeout}s)")
     click.echo(f"Input: {input_dir}")
     click.echo(f"Output: {output_dir}")
 
@@ -610,121 +759,104 @@ def batch(input_dir, output_dir, mode, grobid_url, workers, timeout, skip_existi
     if checkpoint_file:
         click.echo(f"Checkpoint: {checkpoint_file}")
 
-    # Handle Docker GROBID startup if requested
-    if use_docker and config.requires_grobid():
-        docker_dir = Path(__file__).parent.parent / "docker"
-        docker_compose = docker_dir / "docker-compose.yml"
-
-        if not docker_compose.exists():
-            click.secho(
-                f"Docker config not found at {docker_compose}\n"
-                "Run from pdf4llm root directory or use --grobid-url to connect to existing GROBID",
-                fg="red"
-            )
-            sys.exit(1)
-
-        click.echo(f"Starting GROBID Docker ({docker_mode} mode)...")
-        try:
-            # Stop any existing containers
-            subprocess.run(
-                ["docker", "compose", "-f", str(docker_compose), "down"],
-                capture_output=True, check=False
-            )
-
-            # Start GROBID with selected profile
-            result = subprocess.run(
-                ["docker", "compose", "-f", str(docker_compose),
-                 "--profile", docker_mode, "up", "-d"],
-                check=True, capture_output=True, text=True
-            )
-
-            # Wait for readiness
-            click.echo("Waiting for GROBID to be ready...", nl=False)
-            if _wait_for_grobid(config.grobid_url, timeout=120):
-                click.secho(" OK", fg="green")
-
-                # Get version
-                from .extractors.grobid import GrobidClient
-                client = GrobidClient(config)
-                version = client.get_version()
-                if version:
-                    click.echo(f"GROBID version: {version}")
-                click.echo(f"Mode: {docker_mode} ({'DeLFT deep learning' if docker_mode == 'delft' else 'CRF-only (fastest)'})")
-            else:
-                click.secho(" TIMEOUT", fg="red")
-                subprocess.run(
-                    ["docker", "compose", "-f", str(docker_compose), "down"],
-                    capture_output=True, check=False
-                )
-                sys.exit(1)
-
-        except subprocess.CalledProcessError as e:
-            click.secho(
-                f"Failed to start GROBID Docker: {e.stderr if e.stderr else str(e)}",
-                fg="red"
-            )
-            sys.exit(1)
-        except FileNotFoundError:
-            click.secho(
-                "Docker or docker-compose not found. Please install Docker first.",
-                fg="red"
-            )
-            sys.exit(1)
-
-        # Skip normal GROBID startup logic
-        no_auto_grobid = True
-
     # GROBID lifecycle management
     grobid_proc = None
     using_delft = False
     grobid_dir = None
 
-    if config.requires_grobid() and not use_docker:
-        # Check DeLFT BEFORE pinging GROBID — catches already-running instances too
-        try:
-            grobid_dir = _find_grobid_dir(grobid_home)
-        except click.ClickException as e:
-            click.secho(f"\n{e.message}", fg="red")
-            sys.exit(1)
-        _require_delft(grobid_dir, run_without_delft)
+    if not use_docling:
+        # Handle Docker GROBID startup if requested
+        if use_docker and config.requires_grobid():
+            docker_dir = Path(__file__).parent.parent / "docker"
+            docker_compose = docker_dir / "docker-compose.yml"
 
-    if config.requires_grobid():
-        from .extractors.grobid import GrobidClient
-        click.echo(f"Checking GROBID at {config.grobid_url}...", nl=False)
-        client = GrobidClient(config)
-        already_running = client.is_alive(timeout=5)
+            if not docker_compose.exists():
+                click.secho(
+                    f"Docker config not found at {docker_compose}\n"
+                    "Run from pdf4llm root directory or use --grobid-url to connect to existing GROBID",
+                    fg="red"
+                )
+                sys.exit(1)
 
-        if already_running and no_auto_grobid:
-            # User manages GROBID externally; trust it and continue
-            click.secho(" OK (external)", fg="green")
-            click.secho("✓ DeLFT deep learning models: ACTIVE", fg="green", bold=True)
-            using_delft = True
-        elif no_auto_grobid:
-            click.secho(" NOT AVAILABLE", fg="red")
-            click.echo("GROBID is not running and --no-auto-grobid was specified.")
-            sys.exit(1)
-        else:
-            if already_running:
-                click.secho(" running — restarting with DeLFT", fg="yellow")
-                _kill_grobid_on_port(8070)
-            else:
-                click.secho(" not running", fg="yellow")
+            click.echo(f"Starting GROBID Docker ({docker_mode} mode)...")
             try:
-                grobid_proc, using_delft = _start_grobid(grobid_dir, run_without_delft=run_without_delft)
-                click.echo(f"Waiting for GROBID to be ready at {config.grobid_url}...", nl=False)
+                subprocess.run(
+                    ["docker", "compose", "-f", str(docker_compose), "down"],
+                    capture_output=True, check=False
+                )
+                result = subprocess.run(
+                    ["docker", "compose", "-f", str(docker_compose),
+                     "--profile", docker_mode, "up", "-d"],
+                    check=True, capture_output=True, text=True
+                )
+                click.echo("Waiting for GROBID to be ready...", nl=False)
                 if _wait_for_grobid(config.grobid_url, timeout=120):
                     click.secho(" OK", fg="green")
-                    if using_delft:
-                        click.secho("✓ DeLFT deep learning models: ACTIVE", fg="green", bold=True)
-                    else:
-                        click.secho("✗ DeLFT not active — running CRF-only mode", fg="yellow")
+                    from .extractors.grobid import GrobidClient
+                    client = GrobidClient(config)
+                    version = client.get_version()
+                    if version:
+                        click.echo(f"GROBID version: {version}")
+                    click.echo(f"Mode: {docker_mode} ({'DeLFT deep learning' if docker_mode == 'delft' else 'CRF-only (fastest)'})")
                 else:
                     click.secho(" TIMEOUT", fg="red")
-                    _stop_grobid(grobid_proc)
+                    subprocess.run(
+                        ["docker", "compose", "-f", str(docker_compose), "down"],
+                        capture_output=True, check=False
+                    )
                     sys.exit(1)
+            except subprocess.CalledProcessError as e:
+                click.secho(f"Failed to start GROBID Docker: {e.stderr if e.stderr else str(e)}", fg="red")
+                sys.exit(1)
+            except FileNotFoundError:
+                click.secho("Docker or docker-compose not found. Please install Docker first.", fg="red")
+                sys.exit(1)
+            no_auto_grobid = True
+
+        if config.requires_grobid() and not use_docker:
+            try:
+                grobid_dir = _find_grobid_dir(grobid_home)
             except click.ClickException as e:
                 click.secho(f"\n{e.message}", fg="red")
                 sys.exit(1)
+            _require_delft(grobid_dir, run_without_delft)
+
+        if config.requires_grobid():
+            from .extractors.grobid import GrobidClient
+            click.echo(f"Checking GROBID at {config.grobid_url}...", nl=False)
+            client = GrobidClient(config)
+            already_running = client.is_alive(timeout=5)
+
+            if already_running and no_auto_grobid:
+                click.secho(" OK (external)", fg="green")
+                click.secho("✓ DeLFT deep learning models: ACTIVE", fg="green", bold=True)
+                using_delft = True
+            elif no_auto_grobid:
+                click.secho(" NOT AVAILABLE", fg="red")
+                click.echo("GROBID is not running and --no-auto-grobid was specified.")
+                sys.exit(1)
+            else:
+                if already_running:
+                    click.secho(" running — restarting with DeLFT", fg="yellow")
+                    _kill_grobid_on_port(8070)
+                else:
+                    click.secho(" not running", fg="yellow")
+                try:
+                    grobid_proc, using_delft = _start_grobid(grobid_dir, run_without_delft=run_without_delft)
+                    click.echo(f"Waiting for GROBID to be ready at {config.grobid_url}...", nl=False)
+                    if _wait_for_grobid(config.grobid_url, timeout=120):
+                        click.secho(" OK", fg="green")
+                        if using_delft:
+                            click.secho("✓ DeLFT deep learning models: ACTIVE", fg="green", bold=True)
+                        else:
+                            click.secho("✗ DeLFT not active — running CRF-only mode", fg="yellow")
+                    else:
+                        click.secho(" TIMEOUT", fg="red")
+                        _stop_grobid(grobid_proc)
+                        sys.exit(1)
+                except click.ClickException as e:
+                    click.secho(f"\n{e.message}", fg="red")
+                    sys.exit(1)
 
     processor = BatchProcessor(config, checkpoint_file)
 
@@ -757,14 +889,14 @@ def batch(input_dir, output_dir, mode, grobid_url, workers, timeout, skip_existi
 
 
 @cli.command("health-check")
-@click.option("--grobid-url", default="http://localhost:8070",
+@click.option("--grobid-url", default="http://127.0.0.1:8070",
               help="GROBID server URL")
 def health_check(grobid_url):
     """Check GROBID server health.
 
     Example:
-        pdf2md health-check
-        pdf2md health-check --grobid-url http://grobid:8070
+        pdf4llm health-check
+        pdf4llm health-check --grobid-url http://grobid:8070
     """
     config = Config(grobid_url=grobid_url)
 
@@ -788,13 +920,13 @@ def health_check(grobid_url):
 
 @cli.command()
 @click.argument("pdf_path", type=click.Path(exists=True))
-@click.option("--grobid-url", default="http://localhost:8070",
+@click.option("--grobid-url", default="http://127.0.0.1:8070",
               help="GROBID server URL")
 def test_extraction(pdf_path, grobid_url):
     """Test extraction on a single PDF and show summary.
 
     Example:
-        pdf2md test-extraction paper.pdf
+        pdf4llm test-extraction paper.pdf
     """
     setup_logging(verbose=True)
 

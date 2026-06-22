@@ -5,11 +5,17 @@
 requests>=2.31.0
 lxml>=4.9.0
 pydantic>=2.0.0
+Pillow>=10.0.0
 
-# PDF extraction
+# PDF extraction — primary pipeline
+docling                          # primary layout extractor (requires ML models on first run)
 pymupdf>=1.23.0
+pymupdf4llm>=0.0.17              # last-resort fallback tier (fast, pure Python)
 pdfplumber>=0.10.0
 pytesseract>=0.3.10
+
+# PDF extraction — optional fallback
+marker-pdf                       # secondary fallback tier (heavy; omit if not needed)
 
 # Utilities
 tqdm>=4.66.0

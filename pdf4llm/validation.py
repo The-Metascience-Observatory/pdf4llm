@@ -26,7 +26,7 @@ def validate_document(document: DocumentModel) -> Tuple[float, List[str]]:
 
     # --- Title validation ---
     title_score = 1.0
-    if not document.title or document.title == "Untitled":
+    if not document.title:
         title_score = 0.0
         issues.append("No title extracted")
     elif not _validate_title(document.title):
@@ -57,12 +57,18 @@ def validate_document(document: DocumentModel) -> Tuple[float, List[str]]:
         issues.append("No document DOI found")
 
     # --- References validation ---
+    # DOIs only became common post-1995; penalising older literature is unfair.
+    pre_doi_era = bool(document.year and document.year < 1995)
+
     if document.references:
         ref_count = len(document.references)
         doi_count = sum(1 for r in document.references if r.doi)
         doi_ratio = doi_count / ref_count
 
-        if doi_ratio < 0.1:
+        if pre_doi_era:
+            # Score by reference count alone — 30 refs is a full paper
+            scores["references"] = min(ref_count / 30, 1.0)
+        elif doi_ratio < 0.1:
             scores["references"] = 0.2
             issues.append(f"Very low DOI rate in references: {doi_count}/{ref_count} ({doi_ratio:.0%})")
         elif doi_ratio < 0.3:

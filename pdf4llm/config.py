@@ -49,18 +49,35 @@ class Config:
     mode: ExtractionMode = ExtractionMode.FULL_GROBID
 
     # GROBID settings
-    grobid_url: str = "http://localhost:8070"
+    grobid_url: str = "http://127.0.0.1:8070"
     grobid_timeout: int = 120  # seconds
     grobid_retry_count: int = 3
     grobid_retry_delay: float = 1.0  # seconds between retries
-
-    # Docker support
-    use_docker_grobid: bool = False  # Whether to expect Docker-based GROBID
-    docker_compose_path: Optional[Path] = None  # Path to docker-compose.yml
+    # Auto-start GROBID via Docker if not already running.
+    # Requires Docker to be installed and running.
+    # grobid_docker_mode: "crf" (lightweight, ~500 MB) or "delft" (highest accuracy, ~8 GB).
+    auto_start_grobid: bool = True
+    grobid_docker_mode: str = "crf"  # "crf" or "delft"
 
     # Output settings
     output_json: bool = True  # Also save JSON alongside Markdown
     output_tei: bool = False  # Save raw TEI XML (for debugging)
+    abstract_only: bool = False  # Only extract abstract → {DOI}_abstract.md
+    no_ocr: bool = False  # Disable Tesseract OCR fallback
+    use_docling: bool = False  # Use docling instead of GROBID for extraction (docling-only mode)
+    docling_use_gpu: bool = False  # Use CUDA for docling (requires GPU and CUDA-enabled docling install)
+
+    # Parallel extraction architecture (new default for FULL_GROBID mode)
+    # When True: runs GROBID AND docling in parallel per PDF, merges outputs
+    # using the best of each tool (GROBID for headers/refs, docling for body/tables)
+    parallel_extraction: bool = True
+    docling_timeout: int = 300  # docling per-PDF timeout (seconds)
+    use_marker_fallback: bool = True  # Try marker-pdf when both GROBID and docling fail
+    marker_timeout: int = 600  # marker per-PDF timeout (seconds)
+    # Final-last-resort fallback: pymupdf4llm (fast, pure Python, no ML).
+    # Runs AFTER marker-pdf has already failed. Produces flat markdown with
+    # heading-based section splitting; no structured references or tables.
+    use_pymupdf_fallback: bool = True
 
     # Batch processing settings
     workers: int = field(default_factory=_default_workers)
@@ -69,6 +86,12 @@ class Config:
 
     # Table extraction settings
     table_quality_threshold: float = 0.8  # Trigger fallback if below (increased for higher accuracy)
+
+    # CrossRef DOI enrichment: run when extracted DOI rate is below this fraction.
+    # Set to 0.0 to disable, or use --no-crossref CLI flag.
+    crossref_enrich_threshold: float = 0.5
+    # Optional email for CrossRef polite pool (faster rate limits).
+    crossref_mailto: Optional[str] = None
 
     # Chart/Figure extraction settings (uses Ollama by default - FREE)
     extract_charts: bool = False  # Enable chart analysis with vision model
@@ -84,15 +107,15 @@ class Config:
         """Create config from environment variables."""
         return cls(
             mode=ExtractionMode.from_string(
-                os.getenv("PDF2MD_MODE", "full-grobid")
+                os.getenv("PDF4LLM_MODE", "full-grobid")
             ),
-            grobid_url=os.getenv("PDF2MD_GROBID_URL", "http://localhost:8070"),
-            grobid_timeout=int(os.getenv("PDF2MD_GROBID_TIMEOUT", "120")),
-            workers=int(os.getenv("PDF2MD_WORKERS", str(_default_workers()))),
-            output_json=os.getenv("PDF2MD_OUTPUT_JSON", "true").lower() == "true",
-            verbose=os.getenv("PDF2MD_VERBOSE", "false").lower() == "true",
-            use_docker_grobid=os.getenv("PDF2MD_USE_DOCKER_GROBID", "false").lower() == "true",
-            docker_compose_path=Path(os.getenv("PDF2MD_DOCKER_COMPOSE_PATH", "docker/docker-compose.yml")) if os.getenv("PDF2MD_DOCKER_COMPOSE_PATH") else None,
+            grobid_url=os.getenv("PDF4LLM_GROBID_URL", "http://127.0.0.1:8070"),
+            grobid_timeout=int(os.getenv("PDF4LLM_GROBID_TIMEOUT", "120")),
+            workers=int(os.getenv("PDF4LLM_WORKERS", str(_default_workers()))),
+            output_json=os.getenv("PDF4LLM_OUTPUT_JSON", "true").lower() == "true",
+            verbose=os.getenv("PDF4LLM_VERBOSE", "false").lower() == "true",
+            crossref_enrich_threshold=float(os.getenv("PDF4LLM_CROSSREF_THRESHOLD", "0.5")),
+            crossref_mailto=os.getenv("PDF4LLM_CROSSREF_MAILTO"),
         )
 
     def requires_grobid(self) -> bool:
@@ -107,6 +130,8 @@ class Config:
             raise ValueError("grobid_timeout must be at least 1 second")
         if not 0 <= self.table_quality_threshold <= 1:
             raise ValueError("table_quality_threshold must be between 0 and 1")
+        if not 0 <= self.crossref_enrich_threshold <= 1:
+            raise ValueError("crossref_enrich_threshold must be between 0 and 1")
 
 
 # Default configuration instance

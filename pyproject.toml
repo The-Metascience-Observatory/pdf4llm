@@ -6,19 +6,50 @@ build-backend = "setuptools.build_meta"
 name = "pdf4llm"
 version = "1.0.0"
 description = "PDF-to-Markdown and JSON converter optimized for LLM analysis of scientific papers"
+readme = "README.md"
 requires-python = ">=3.9"
+license = "AGPL-3.0-or-later"
+license-files = ["LICENSE", "NOTICE"]
+authors = [
+    {name = "The Metascience Observatory"},
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Text Processing :: Markup",
+]
+# NOTE: Per PEP 639, the SPDX `license = "AGPL-3.0-or-later"` expression above
+# is the authoritative license declaration. The legacy
+# `License :: OSI Approved :: GNU Affero General Public License v3 or later
+# (AGPLv3+)` trove classifier is intentionally omitted because setuptools>=77
+# treats the two as mutually exclusive.
 dependencies = [
     "requests>=2.31.0",
     "lxml>=4.9.0",
     "pydantic>=2.0.0",
+    "docling",               # primary layout extractor (downloads ML models on first run)
     "pymupdf>=1.23.0",
+    "pymupdf4llm>=0.0.17",  # last-resort fallback tier (pure-Python PyMuPDF wrapper)
     "pdfplumber>=0.10.0",
     "tqdm>=4.66.0",
     "click>=8.0.0",
     "Pillow>=10.0.0",
+    "pytesseract>=0.3.10",
 ]
 
 [project.optional-dependencies]
+marker = [
+    "marker-pdf",            # secondary fallback tier; heavy ML dependency
+]
 dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",

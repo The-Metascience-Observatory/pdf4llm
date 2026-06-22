@@ -119,6 +119,7 @@ class DocumentModel(BaseModel):
     # Document identifiers
     doi: Optional[str] = Field(None, description="Paper DOI if found")
     title: str = Field("", description="Paper title")
+    year: Optional[int] = Field(None, description="Publication year")
 
     # Content
     abstract: Optional[str] = Field(None, description="Paper abstract")
