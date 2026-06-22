@@ -308,6 +308,8 @@ def setup_logging(verbose: bool = False):
         format="%(asctime)s - %(levelname)s - %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+    from .pipeline import _quiet_docling_noise
+    _quiet_docling_noise()
 
 
 def _check_tesseract():

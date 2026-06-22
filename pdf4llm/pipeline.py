@@ -261,14 +261,19 @@ def _quiet_docling_noise():
     for name in noisy_loggers:
         _logging.getLogger(name).setLevel(_logging.WARNING)
 
-    # Install a filter that drops known-benign ERROR messages from docling
-    # that our pipeline already handles gracefully (caught by _try_docling).
+    # Tesseract OCR loggers only ever emit noise (OSD failures, command spam).
+    # Fully disable them by setting level above CRITICAL so Python won't even
+    # create a LogRecord — this is more reliable than a filter-based approach.
+    for name in [
+        "docling.models.stages.ocr.tesseract_ocr_cli_model",
+        "docling.models.stages.ocr.tesseract_ocr_model",
+    ]:
+        _logging.getLogger(name).setLevel(_logging.CRITICAL + 1)
+
+    # Install a filter that drops known-benign ERROR messages from the document
+    # logger that our pipeline already handles gracefully (caught by _try_docling).
     class _DoclingNoisyFilter(_logging.Filter):
         _DROP_PATTERNS = (
-            # Tesseract OSD orientation detection failures — always a benign fallback
-            ("OSD failed",),
-            # Tesseract OCR failures — docling handles them gracefully
-            ("tesseract OCR failed",),
             # PdfiumError / corrupt PDF — caught by _try_docling, pipeline falls through
             ("An unexpected error occurred while opening the document",),
         )
@@ -281,12 +286,7 @@ def _quiet_docling_noise():
             return True
 
     noisy_filter = _DoclingNoisyFilter()
-    for name in [
-        "docling.models.stages.ocr.tesseract_ocr_cli_model",
-        "docling.models.stages.ocr.tesseract_ocr_model",
-        "docling.datamodel.document",
-    ]:
-        _logging.getLogger(name).addFilter(noisy_filter)
+    _logging.getLogger("docling.datamodel.document").addFilter(noisy_filter)
 
 
 def _extract_with_docling(pdf_path: Path, config: Config) -> tuple:
