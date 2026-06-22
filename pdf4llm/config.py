@@ -51,8 +51,6 @@ class Config:
     # GROBID settings
     grobid_url: str = "http://127.0.0.1:8070"
     grobid_timeout: int = 120  # seconds
-    grobid_retry_count: int = 3
-    grobid_retry_delay: float = 1.0  # seconds between retries
     # Auto-start GROBID via Docker if not already running.
     # Requires Docker to be installed and running.
     # grobid_docker_mode: "crf" (lightweight, ~500 MB) or "delft" (highest accuracy, ~8 GB).
@@ -63,6 +61,7 @@ class Config:
     output_json: bool = True  # Also save JSON alongside Markdown
     output_tei: bool = False  # Save raw TEI XML (for debugging)
     abstract_only: bool = False  # Only extract abstract → {DOI}_abstract.md
+    single_markdown: bool = False  # Combine everything into one flat <stem>.md (no subfolder, no JSON)
     no_ocr: bool = False  # Disable Tesseract OCR fallback
     use_docling: bool = False  # Use docling instead of GROBID for extraction (docling-only mode)
     docling_use_gpu: bool = False  # Use CUDA for docling (requires GPU and CUDA-enabled docling install)
@@ -120,6 +119,8 @@ class Config:
 
     def requires_grobid(self) -> bool:
         """Check if the current mode requires GROBID."""
+        if self.use_docling:
+            return False
         return self.mode in (ExtractionMode.FULL_GROBID, ExtractionMode.HYBRID)
 
     def __post_init__(self):

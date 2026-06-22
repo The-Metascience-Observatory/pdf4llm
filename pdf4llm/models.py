@@ -165,7 +165,7 @@ class ProcessingResult(BaseModel):
 
     pdf_path: str = Field(..., description="Path to source PDF")
     status: str = Field(..., description="success/partial/failed")
-    output_dir: Optional[str] = Field(None, description="Path to output directory (contains abstract.md, body.md, references.json, tables.md)")
+    output_dir: Optional[str] = Field(None, description="Path to output directory (contains abstract.md, body.md, references.json)")
     errors: List[ProcessingError] = Field(default_factory=list, description="Errors encountered")
     warnings: List[str] = Field(default_factory=list, description="Warnings")
     processing_time_seconds: float = Field(0, description="Processing time in seconds")

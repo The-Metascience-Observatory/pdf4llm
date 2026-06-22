@@ -6,7 +6,10 @@ services:
   grobid-delft:
     image: grobid/grobid:0.8.2-full
     container_name: grobid-delft
-    network_mode: host
+    # `ports` (not `network_mode: host`) — host networking does not work on
+    # Docker Desktop for macOS; the container would be unreachable from the host.
+    ports:
+      - "8070:8070"
     environment:
       - JAVA_OPTS=-Xmx6g -Xms2g
     healthcheck:
@@ -22,7 +25,8 @@ services:
   grobid-crf:
     image: grobid/grobid:0.8.2-crf
     container_name: grobid-crf
-    network_mode: host
+    ports:
+      - "8070:8070"
     environment:
       - JAVA_OPTS=-Xmx4g -Xms2g
     healthcheck:

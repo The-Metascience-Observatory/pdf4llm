@@ -8,12 +8,13 @@ High-quality PDF → structured Markdown/JSON converter for scientific papers. O
 
 ```
 pdf4llm/
+├── launcher.py          — stdlib-only console-script entry; manages venv, re-execs into cli.py
+├── install_grobid.py    — auto-install GROBID via Docker (DeLFT/CRF), auto-bump Docker Desktop RAM on macOS
 ├── cli.py               — Click CLI: `convert`, `batch`, `health-check` commands
 ├── config.py            — Config dataclass + ExtractionMode enum
 ├── models.py            — Pydantic models: DocumentModel, ProcessingResult, BatchResult, Reference, Section, Table
 ├── pipeline.py          — convert_single(), BatchProcessor, merge logic, docling wrapper
 ├── validation.py        — validate_document() → (score: float, issues: list[str])
-├── utils.py             — misc helpers
 ├── extractors/
 │   ├── grobid.py        — GROBID HTTP client, TEI parser, _normalize_doi
 │   ├── fast.py          — PyMuPDF + pdfplumber path, _extract_doi_from_filename, _validate_title
@@ -73,7 +74,6 @@ Config(mode=ExtractionMode.FULL_GROBID, workers=2, parallel_extraction=True, ...
 ├── body.md             — main text with sections/tables (docling)
 ├── references.json     — [{authors, title, journal, year, doi, …}, …] (GROBID)
 ├── references.md       — references as prose (docling raw markdown)
-├── tables.md           — extracted tables
 └── provenance.json     — per-field attribution: which extractor produced what
 ```
 
@@ -99,6 +99,7 @@ For large runs (tens of thousands of PDFs), the parallel path uses a **throttled
 | `use_marker_fallback` | `True` | marker-pdf tier after GROBID+docling fail |
 | `use_pymupdf_fallback` | `True` | pymupdf4llm last-resort tier |
 | `abstract_only` | `False` | Write `{doi}_abstract.md` only, no subfolder |
+| `single_markdown` | `False` | Write one flat `<stem>.md` (or `<doi>.md`) per PDF: title + abstract + body + tables + numbered refs. No subfolder, no JSON, no images. |
 | `crossref_enrich_threshold` | `0.5` | Run CrossRef DOI enrichment when DOI rate < 50% |
 | `auto_start_grobid` | `True` | Auto-start GROBID at `../grobid/` |
 
@@ -127,6 +128,10 @@ pdf4llm convert paper.pdf -o output/ --docling-only
 # Fast mode (PyMuPDF only; no ML)
 pdf4llm convert paper.pdf -o output/ --mode fast
 
+# Single-file output (one <stem>.md per PDF, no subfolder)
+pdf4llm convert paper.pdf -o output/ --single-markdown
+pdf4llm batch ./pdfs/ -o ./output/ --single-markdown --workers 2
+
 # Debug with verbose logging
 pdf4llm convert paper.pdf -o output/ -v
 ```
@@ -135,19 +140,34 @@ pdf4llm convert paper.pdf -o output/ -v
 
 ## GROBID setup (required for full-grobid mode)
 
-GROBID lives at `../grobid/` relative to this repo (sibling directory). pdf4llm auto-starts it via the local build; DeLFT (deep learning models) requires a Python 3.10 venv at `~/venv_grobid` with:
-```
-jep==4.2.2  delft==0.3.4  transformers==4.44.2  Pillow
-```
-Missing `Pillow` causes every GROBID request to return HTTP 500 while `/api/isalive` still returns 200.
+**Default path (recommended): Docker.** When `pdf4llm <pdf>` is run and GROBID isn't responding, `install_grobid.prompt_and_install()` detects 4 states (Docker missing, image missing, container exited, container present-but-unresponsive) and offers to install/start GROBID DeLFT via `docker/docker-compose.yml`. On macOS, if Docker Desktop has < 8 GB allocated, `_check_docker_resources()` auto-bumps it to 10 GB by editing `~/Library/Group Containers/group.com.docker/settings.json` and bouncing the Docker app (backup written as `settings.json.pdf4llm-backup`). Container exit codes 134/137/139 surface as "JVM ran out of memory — bump Docker RAM".
 
-Docker alternative: `./docker/start-grobid.sh delft` (then pass `--no-auto-grobid`).
+Compose file uses `ports: ["8070:8070"]` (NOT `network_mode: host` — broken on Docker Desktop for Mac). Live log tail in `_wait_for_grobid()` shows model-by-model load progress during the 2-5 min cold-start (300 s timeout for DeLFT, 120 s for CRF).
+
+**Manual CLI entry point:** `pdf4llm-install-grobid [--mode delft|crf|source]`.
+
+**Source-build path (legacy):** GROBID at `../grobid/` (sibling). DeLFT needs Python 3.10 venv at `~/venv_grobid` with `jep==4.2.2  delft==0.3.4  transformers==4.44.2  Pillow`. Missing `Pillow` → every GROBID request returns HTTP 500 while `/api/isalive` returns 200.
+
+## Launcher / managed venv
+
+The `pdf4llm` console script points at `pdf4llm.launcher:main`, NOT `cli:main`. The launcher (stdlib-only, no heavy imports) ensures pdf4llm runs in an isolated venv so the user's base/anaconda environment can't break it with numpy ABI conflicts. Behavior:
+
+- On first run: prompts for venv path (default `<repo>/.venv`), creates it with `--upgrade-deps`, runs `pip install -e <repo>` inside it, writes `.pdf4llm-ready` marker. Venv path saved to `~/.pdf4llm/config.json`.
+- On subsequent runs: `os.execvpe`s into `<venv>/bin/python -m pdf4llm.cli ...` with `PDF4LLM_VENV_ACTIVE=1` to prevent re-entry.
+- Bypasses: `--no-venv`, `PDF4LLM_VENV_ACTIVE=1`, or any active `VIRTUAL_ENV` → run in-process.
+- Launcher flags: `--venv PATH`, `--no-venv`, `--reinstall-venv`, `--venv-status`.
+- `cli.main()` has a guard that auto-routes to the launcher if `PDF4LLM_VENV_ACTIVE != 1 and !VIRTUAL_ENV and !PDF4LLM_NO_LAUNCHER` — so stale console scripts pointing at `cli:main` still get launcher behavior.
+- `pdf4llm/__init__.py` uses lazy `__getattr__` (no eager Config/DocumentModel imports) so `import pdf4llm.launcher` doesn't drag in heavy deps.
+
+When `ensure_docling()` detects numpy ABI breakage, it refuses to `pip install` unless it's in a venv (was polluting base anaconda); inside a venv it force-reinstalls `numpy pandas pyarrow docling` then `os.execvpe`s with `PDF4LLM_FORCE_DOCLING=1` so the child skips the GROBID prompt.
+
+**Extra env vars:** `PDF4LLM_VENV_ACTIVE`, `PDF4LLM_NO_LAUNCHER`, `PDF4LLM_FORCE_DOCLING`.
 
 ---
 
 ## Key invariants
 
-- **Output is always a subfolder**, never flat files in `output_dir` (except `abstract_only` mode which writes `{doi}_abstract.md` flat).
+- **Output is always a subfolder**, never flat files in `output_dir` (except `abstract_only` which writes `{doi}_abstract.md` flat and `single_markdown` which writes `{stem|doi}.md` flat).
 - **Skip-existing** checks for `abstract.md + body.md` in the per-PDF subfolder. No partial-output retries without deleting the folder first.
 - **Checkpoint** (`BatchProcessor`) tracks absolute PDF paths; stem-collision-aware via `_compute_output_names`.
 - **`BatchResult.results`** in a large batch contains **only failures** (not all 33K entries) — don't rely on it for success records.

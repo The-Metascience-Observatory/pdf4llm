@@ -544,7 +544,7 @@ If the last-resort tier can't import `pymupdf4llm`, pdf4llm will skip it and rec
 pip install --user --break-system-packages pymupdf4llm
 ```
 
-pymupdf4llm is listed as a core dependency in `pyproject.toml` / `requirements.txt`, so this warning usually only appears in partial installs or bespoke environments.
+pymupdf4llm is listed as a core dependency in `pyproject.toml`, so this warning usually only appears in partial installs or bespoke environments.
 
 ### Record has `extraction_mode: pymupdf4llm-fallback` — what does that mean for downstream?
 

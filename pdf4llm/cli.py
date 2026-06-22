@@ -24,22 +24,40 @@ import requests
 from .config import Config, ExtractionMode
 from .pipeline import convert_single, BatchProcessor, check_grobid_health, GROBID_CRASH_MARKERS
 
-# Default GROBID source directory (sibling of pdf4llm package)
-_DEFAULT_GROBID_DIR = Path(__file__).resolve().parent.parent.parent / "grobid"
+# GROBID source directory: sibling of the pdf4llm/ package (pdf4llm repo root).
+# Created by `pdf4llm-install-grobid --mode source`. With `pip install -e .`
+# this is the project root and is listed in .gitignore.
+_GROBID_SEARCH_PATHS = [
+    Path(__file__).resolve().parent.parent / "grobid",
+]
+
+
+def _is_built_grobid_dir(p: Path) -> bool:
+    """A GROBID source dir is only usable if Gradle has already built the JAR."""
+    if not (p / "gradlew").exists():
+        return False
+    jars = list((p / "grobid-service" / "build" / "libs").glob("grobid-service-*-onejar.jar"))
+    return bool(jars)
 
 
 def _find_grobid_dir(grobid_home: str = None) -> Path:
-    """Find the GROBID source directory."""
+    """Find a usable (built) GROBID source directory."""
     if grobid_home:
         p = Path(grobid_home)
-        if (p / "gradlew").exists():
+        if _is_built_grobid_dir(p):
             return p
-        raise click.ClickException(f"GROBID not found at {p} (no gradlew)")
-    if (_DEFAULT_GROBID_DIR / "gradlew").exists():
-        return _DEFAULT_GROBID_DIR
+        raise click.ClickException(
+            f"GROBID at {p} is not built (no grobid-service onejar). "
+            f"Build it with: cd {p} && ./gradlew clean install"
+        )
+    for candidate in _GROBID_SEARCH_PATHS:
+        if _is_built_grobid_dir(candidate):
+            return candidate
+    searched = ", ".join(str(p) for p in _GROBID_SEARCH_PATHS)
     raise click.ClickException(
-        f"GROBID source not found at {_DEFAULT_GROBID_DIR}. "
-        "Use --grobid-home to specify the GROBID source directory."
+        f"No built GROBID source found (searched: {searched}). "
+        "Run `pdf4llm-install-grobid` to set up GROBID via Docker, "
+        "or pass --grobid-home <built-grobid-dir>."
     )
 
 
@@ -234,17 +252,32 @@ def _kill_grobid_on_port(port: int = 8070):
 
 
 def _wait_for_grobid(url: str, timeout: int = 120) -> bool:
-    """Poll GROBID until it responds or timeout is reached."""
-    deadline = time.time() + timeout
+    """Poll GROBID until it responds or timeout is reached. Shows live elapsed/ETA bar."""
+    start = time.time()
+    deadline = start + timeout
     alive_url = f"{url}/api/isalive"
+    click.echo(f"Waiting for GROBID to load (DeLFT cold-start takes ~2-3 min; timeout {timeout}s):")
     while time.time() < deadline:
         try:
             r = requests.get(alive_url, timeout=5)
             if r.status_code == 200:
+                elapsed = int(time.time() - start)
+                click.echo(f"\r  ✓ GROBID ready after {elapsed}s" + " " * 40)
                 return True
         except requests.ConnectionError:
             pass
+        elapsed = int(time.time() - start)
+        remaining = max(0, int(deadline - time.time()))
+        bar_len = 30
+        filled = min(bar_len, int(bar_len * elapsed / timeout))
+        bar = "█" * filled + "░" * (bar_len - filled)
+        click.echo(
+            f"\r  [{bar}] {elapsed:>3}s elapsed, ~{remaining:>3}s until timeout",
+            nl=False,
+        )
+        sys.stdout.flush()
         time.sleep(2)
+    click.secho(f"\r  ✗ TIMEOUT after {timeout}s" + " " * 40, fg="red")
     return False
 
 
@@ -387,6 +420,10 @@ def cli():
               help="Allow running in CRF-only mode when DeLFT is unavailable (lower accuracy)")
 @click.option("--extract-abstract-only", is_flag=True,
               help="Only extract abstracts. Saves as {DOI}_abstract.md (no subfolders)")
+@click.option("--single-markdown", "single_markdown", is_flag=True,
+              help="Write one combined <stem>.md per PDF (title + abstract + body + "
+                   "tables + numbered references). No subfolder, no JSON, no images. "
+                   "Mutually exclusive with --extract-abstract-only.")
 @click.option("--noocr", is_flag=True,
               help="Disable Tesseract OCR fallback (skip PDFs that fail GROBID extraction)")
 @click.option("--no-crossref", "no_crossref", is_flag=True,
@@ -414,7 +451,8 @@ def cli():
 @click.option("-v", "--verbose", is_flag=True, help="Verbose output")
 def convert(pdf_path, output_dir, mode, grobid_url, no_json, save_tei,
             extract_charts, chart_model, ollama_url, grobid_home, no_auto_grobid,
-            use_docker, docker_mode, movepdf, run_without_delft, extract_abstract_only, noocr,
+            use_docker, docker_mode, movepdf, run_without_delft, extract_abstract_only,
+            single_markdown, noocr,
             no_crossref, use_docling, no_parallel, no_marker_fallback, no_pymupdf_fallback,
             docling_gpu, no_docling_gpu, verbose):
     """Convert a single PDF to Markdown.
@@ -428,6 +466,9 @@ def convert(pdf_path, output_dir, mode, grobid_url, no_json, save_tei,
     """
     setup_logging(verbose)
     _check_tesseract()
+
+    if extract_abstract_only and single_markdown:
+        raise click.BadParameter("--extract-abstract-only and --single-markdown are mutually exclusive.")
 
     # Check Ollama if chart extraction requested
     if extract_charts:
@@ -454,6 +495,7 @@ def convert(pdf_path, output_dir, mode, grobid_url, no_json, save_tei,
         chart_model=chart_model,
         ollama_url=ollama_url,
         abstract_only=extract_abstract_only,
+        single_markdown=single_markdown,
         no_ocr=noocr,
         crossref_enrich_threshold=0.0 if no_crossref else 0.5,
         use_docling=use_docling,
@@ -495,7 +537,7 @@ def convert(pdf_path, output_dir, mode, grobid_url, no_json, save_tei,
                     check=True, capture_output=True, text=True
                 )
                 click.echo("Waiting for GROBID to be ready...", nl=False)
-                if _wait_for_grobid(config.grobid_url, timeout=120):
+                if _wait_for_grobid(config.grobid_url, timeout=300):
                     click.secho(" OK", fg="green")
                     from .extractors.grobid import GrobidClient
                     client = GrobidClient(config)
@@ -522,9 +564,34 @@ def convert(pdf_path, output_dir, mode, grobid_url, no_json, save_tei,
             try:
                 grobid_dir = _find_grobid_dir(grobid_home)
             except click.ClickException as e:
-                click.secho(f"\n{e.message}", fg="red")
-                sys.exit(1)
-            _require_delft(grobid_dir, run_without_delft)
+                # GROBID source not found. Decision tree:
+                #   1. PDF4LLM_FORCE_DOCLING set → user already chose docling earlier
+                #      (typically after a docling reinstall + re-exec); skip the prompt.
+                #   2. GROBID already running externally → use it.
+                #   3. Otherwise → prompt the user. If they install, use it.
+                #   4. If they decline → fall back to docling-only, repairing
+                #      docling first if needed.
+                from .extractors.grobid import GrobidClient
+                from .install_grobid import prompt_and_install, ensure_docling
+                forced_docling = os.environ.get("PDF4LLM_FORCE_DOCLING") == "1"
+                if not forced_docling and GrobidClient(config).is_alive(timeout=3):
+                    no_auto_grobid = True
+                elif not forced_docling and prompt_and_install():
+                    no_auto_grobid = True
+                else:
+                    if not forced_docling:
+                        click.secho(
+                            "GROBID unavailable — falling back to docling-only extraction "
+                            "(lower accuracy on references).",
+                            fg="yellow",
+                        )
+                    if not ensure_docling():
+                        click.secho("docling is also unavailable — cannot proceed.", fg="red")
+                        sys.exit(1)
+                    config.use_docling = True
+                    use_docling = True
+            else:
+                _require_delft(grobid_dir, run_without_delft)
 
         if config.requires_grobid():
             from .extractors.grobid import GrobidClient
@@ -548,7 +615,7 @@ def convert(pdf_path, output_dir, mode, grobid_url, no_json, save_tei,
                 try:
                     grobid_proc, using_delft = _start_grobid(grobid_dir, run_without_delft=run_without_delft)
                     click.echo(f"Waiting for GROBID to be ready...", nl=False)
-                    if _wait_for_grobid(config.grobid_url, timeout=120):
+                    if _wait_for_grobid(config.grobid_url, timeout=300):
                         click.secho(" OK", fg="green")
                         if using_delft:
                             click.secho("✓ DeLFT deep learning models: ACTIVE", fg="green", bold=True)
@@ -592,8 +659,6 @@ def convert(pdf_path, output_dir, mode, grobid_url, no_json, save_tei,
             click.secho(f"Success: {result.output_dir}/", fg="green")
             # List files that actually exist
             output_files = ["abstract.md", "body.md", "references.json"]
-            if (Path(result.output_dir) / "tables.md").exists():
-                output_files.append("tables.md")
             click.echo("  " + ", ".join(output_files))
     elif result.status == "partial":
         click.secho(f"Partial success: {result.output_dir}/", fg="yellow")
@@ -654,6 +719,10 @@ def convert(pdf_path, output_dir, mode, grobid_url, no_json, save_tei,
               help="Allow running in CRF-only mode when DeLFT is unavailable (lower accuracy)")
 @click.option("--extract-abstract-only", is_flag=True,
               help="Only extract abstracts. Saves as {DOI}_abstract.md (no subfolders)")
+@click.option("--single-markdown", "single_markdown", is_flag=True,
+              help="Write one combined <stem>.md per PDF (title + abstract + body + "
+                   "tables + numbered references). No subfolder, no JSON, no images. "
+                   "Mutually exclusive with --extract-abstract-only.")
 @click.option("--noocr", is_flag=True,
               help="Disable Tesseract OCR fallback (skip PDFs that fail GROBID extraction)")
 @click.option("--no-crossref", "no_crossref", is_flag=True,
@@ -683,7 +752,7 @@ def convert(pdf_path, output_dir, mode, grobid_url, no_json, save_tei,
                    "two workers run docling on CUDA and two run on CPU.")
 @click.option("-v", "--verbose", is_flag=True, help="Verbose output")
 def batch(input_dir, output_dir, mode, grobid_url, workers, timeout, skip_existing,
-          resume, checkpoint, no_json, grobid_home, no_auto_grobid, use_docker, docker_mode, movepdf, run_without_delft, extract_abstract_only, noocr, no_crossref, use_docling, no_parallel, no_marker_fallback, no_pymupdf_fallback, docling_gpu, no_docling_gpu, gpu_slots, verbose):
+          resume, checkpoint, no_json, grobid_home, no_auto_grobid, use_docker, docker_mode, movepdf, run_without_delft, extract_abstract_only, single_markdown, noocr, no_crossref, use_docling, no_parallel, no_marker_fallback, no_pymupdf_fallback, docling_gpu, no_docling_gpu, gpu_slots, verbose):
     """Convert a folder of PDFs to Markdown.
 
     GROBID is auto-started with DeLFT (highest accuracy) if not already running.
@@ -695,6 +764,9 @@ def batch(input_dir, output_dir, mode, grobid_url, workers, timeout, skip_existi
         pdf4llm batch ./pdfs/ -o ./markdown/ --movepdf
     """
     setup_logging(verbose)
+
+    if extract_abstract_only and single_markdown:
+        raise click.BadParameter("--extract-abstract-only and --single-markdown are mutually exclusive.")
 
     # Docling GPU default: auto-enable when --workers >= 2 and CUDA is available,
     # unless the user explicitly opted out with --no-docling-gpu. The _GPU_SLOT
@@ -731,6 +803,7 @@ def batch(input_dir, output_dir, mode, grobid_url, workers, timeout, skip_existi
         grobid_timeout=timeout,
         output_json=not no_json,
         abstract_only=extract_abstract_only,
+        single_markdown=single_markdown,
         no_ocr=noocr,
         crossref_enrich_threshold=0.0 if no_crossref else 0.5,
         use_docling=use_docling,
@@ -792,7 +865,7 @@ def batch(input_dir, output_dir, mode, grobid_url, workers, timeout, skip_existi
                     check=True, capture_output=True, text=True
                 )
                 click.echo("Waiting for GROBID to be ready...", nl=False)
-                if _wait_for_grobid(config.grobid_url, timeout=120):
+                if _wait_for_grobid(config.grobid_url, timeout=300):
                     click.secho(" OK", fg="green")
                     from .extractors.grobid import GrobidClient
                     client = GrobidClient(config)
@@ -819,9 +892,34 @@ def batch(input_dir, output_dir, mode, grobid_url, workers, timeout, skip_existi
             try:
                 grobid_dir = _find_grobid_dir(grobid_home)
             except click.ClickException as e:
-                click.secho(f"\n{e.message}", fg="red")
-                sys.exit(1)
-            _require_delft(grobid_dir, run_without_delft)
+                # GROBID source not found. Decision tree:
+                #   1. PDF4LLM_FORCE_DOCLING set → user already chose docling earlier
+                #      (typically after a docling reinstall + re-exec); skip the prompt.
+                #   2. GROBID already running externally → use it.
+                #   3. Otherwise → prompt the user. If they install, use it.
+                #   4. If they decline → fall back to docling-only, repairing
+                #      docling first if needed.
+                from .extractors.grobid import GrobidClient
+                from .install_grobid import prompt_and_install, ensure_docling
+                forced_docling = os.environ.get("PDF4LLM_FORCE_DOCLING") == "1"
+                if not forced_docling and GrobidClient(config).is_alive(timeout=3):
+                    no_auto_grobid = True
+                elif not forced_docling and prompt_and_install():
+                    no_auto_grobid = True
+                else:
+                    if not forced_docling:
+                        click.secho(
+                            "GROBID unavailable — falling back to docling-only extraction "
+                            "(lower accuracy on references).",
+                            fg="yellow",
+                        )
+                    if not ensure_docling():
+                        click.secho("docling is also unavailable — cannot proceed.", fg="red")
+                        sys.exit(1)
+                    config.use_docling = True
+                    use_docling = True
+            else:
+                _require_delft(grobid_dir, run_without_delft)
 
         if config.requires_grobid():
             from .extractors.grobid import GrobidClient
@@ -846,7 +944,7 @@ def batch(input_dir, output_dir, mode, grobid_url, workers, timeout, skip_existi
                 try:
                     grobid_proc, using_delft = _start_grobid(grobid_dir, run_without_delft=run_without_delft)
                     click.echo(f"Waiting for GROBID to be ready at {config.grobid_url}...", nl=False)
-                    if _wait_for_grobid(config.grobid_url, timeout=120):
+                    if _wait_for_grobid(config.grobid_url, timeout=300):
                         click.secho(" OK", fg="green")
                         if using_delft:
                             click.secho("✓ DeLFT deep learning models: ACTIVE", fg="green", bold=True)
@@ -990,6 +1088,17 @@ def main():
     instead of:
         pdf4llm batch . -o output/
     """
+    # Auto-route via the launcher when invoked from outside any venv.
+    # This catches the case where a stale `pdf4llm` console script (generated
+    # before the launcher entry point existed) still calls cli.main directly.
+    # The launcher will set up an isolated venv and re-exec into it, instead
+    # of running heavy code and pip-installing into base Python.
+    if (os.environ.get("PDF4LLM_VENV_ACTIVE") != "1"
+            and not os.environ.get("VIRTUAL_ENV")
+            and not os.environ.get("PDF4LLM_NO_LAUNCHER")):
+        from .launcher import main as launcher_main
+        return launcher_main()
+
     args = sys.argv[1:]
     if args and not args[0].startswith("-"):
         first = args[0]

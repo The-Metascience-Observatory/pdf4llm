@@ -15,11 +15,8 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
-import urllib.parse
 import gc
-import itertools
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from datetime import datetime
 from pathlib import Path
@@ -34,10 +31,9 @@ from .models import (
 from .extractors.grobid import extract_with_grobid, GrobidError, GrobidScannedPdfError, GrobidClient, _normalize_doi
 from .extractors.fast import extract_fast, _extract_doi_from_filename, _validate_title, REF_HEADING_PATTERNS
 from .extractors.doi_lookup import fetch_title_from_doi
-from .extractors.tables import assess_table_quality
 from .extractors.ocr_fallback import needs_ocr_fallback, extract_with_ocr
-from .renderers.markdown import render_markdown, render_abstract_md, render_body_md, render_tables_md
-from .renderers.json_output import render_json, render_references_json
+from .renderers.markdown import render_abstract_md, render_body_md, render_single_markdown
+from .renderers.json_output import render_references_json
 from .validation import validate_document
 
 logger = logging.getLogger(__name__)
@@ -1085,6 +1081,23 @@ def convert_single(
                 document.title = api_title
                 logger.info(f"Title from DOI API for {pdf_path.name}: {api_title[:80]}")
 
+    # Single-markdown mode: write one flat <slug>.md in output_dir; skip subfolder/json/etc.
+    if config.single_markdown and document:
+        slug = re.sub(r'[^\w.\-]', '--', (document.doi or stem))
+        md = render_single_markdown(document, docling_raw_md)
+        out_path = output_dir / f"{slug}.md"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(md, encoding="utf-8")
+        processing_time = time.time() - start_time
+        return ProcessingResult(
+            pdf_path=str(pdf_path),
+            status="success",
+            output_dir=str(output_dir),
+            errors=errors,
+            warnings=warnings,
+            processing_time_seconds=round(processing_time, 2),
+        )
+
     # Abstract-only mode: save {DOI}_abstract.md directly in output_dir, skip everything else
     if config.abstract_only and document:
         doi_slug = re.sub(r'[^\w.\-]', '--', (document.doi or stem))
@@ -1120,7 +1133,6 @@ def convert_single(
     body_path = effective_output_dir / "body.md"
     refs_path = effective_output_dir / "references.json"
     refs_md_path = effective_output_dir / "references.md"
-    tables_path = effective_output_dir / "tables.md"
     tei_path = effective_output_dir / f"{stem}.tei.xml"
     provenance_path = effective_output_dir / "provenance.json"
 
@@ -1286,7 +1298,7 @@ def convert_single(
             # if we created it but ultimately failed.
             try:
                 for p in (abstract_path, body_path, refs_path, refs_md_path,
-                          tables_path, tei_path, provenance_path):
+                          tei_path, provenance_path):
                     if p.exists():
                         p.unlink()
                 if effective_output_dir.exists() and effective_output_dir != output_dir \
@@ -1568,7 +1580,7 @@ class BatchProcessor:
                     # A valid entry MUST have all three core files on disk.
                     # abstract_only mode uses a different layout, so skip this
                     # check when running in that mode.
-                    if self.config.abstract_only:
+                    if self.config.abstract_only or self.config.single_markdown:
                         validated.add(path_str)
                         continue
                     if (folder / "abstract.md").exists() and \
@@ -1719,6 +1731,14 @@ class BatchProcessor:
                     if doi_from_fn:
                         doi_slug = re.sub(r'[^\w.\-]', '--', doi_from_fn)
                         if (output_dir / f"{doi_slug}_abstract.md").exists():
+                            continue
+                elif self.config.single_markdown:
+                    if (output_dir / f"{stem}.md").exists():
+                        continue
+                    doi_from_fn = _extract_doi_from_filename(pdf)
+                    if doi_from_fn:
+                        doi_slug = re.sub(r'[^\w.\-]', '--', doi_from_fn)
+                        if (output_dir / f"{doi_slug}.md").exists():
                             continue
                 else:
                     out = output_dir / out_names[pdf]

@@ -58,7 +58,10 @@ dev = [
 ]
 
 [project.scripts]
-pdf4llm = "pdf4llm.cli:main"
+# pdf4llm = thin stdlib-only launcher that ensures we run inside an isolated
+# venv (auto-created on first run) and re-execs `python -m pdf4llm.cli` there.
+pdf4llm = "pdf4llm.launcher:main"
+pdf4llm-install-grobid = "pdf4llm.install_grobid:main"
 
 [tool.setuptools.packages.find]
 include = ["pdf4llm*"]
