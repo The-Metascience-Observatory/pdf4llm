@@ -170,6 +170,21 @@ _GPU_SLOT: Optional[_threading.Semaphore] = None
 _GPU_SLOT_LOCK = _threading.Lock()
 _GPU_AVAILABLE_CACHE: Optional[bool] = None
 
+# Cache of docling DocumentConverter instances, keyed by (use_gpu, thread_id).
+# Reused across PDFs so docling's transformers-based layout model loads ONCE per
+# worker thread instead of once per document — this was the source of the repeated
+# "Loading weights" spam and a real per-PDF re-init cost. Per-thread keying keeps it
+# safe for the threaded BatchProcessor (docling converters aren't safe to share
+# across threads).
+_CONVERTER_CACHE: dict = {}
+_CONVERTER_CACHE_LOCK = _threading.Lock()
+
+# Min characters of extracted markdown per page below which the no-OCR docling
+# pass is considered "low quality" (likely a scanned / image-only PDF) and is
+# transparently retried WITH OCR. Born-digital papers yield thousands of chars
+# per page; scanned PDFs without OCR yield ~0.
+_DOCLING_OCR_MIN_CHARS_PER_PAGE = 100
+
 
 def _get_gpu_slot() -> _threading.Semaphore:
     """Return the GPU semaphore, initializing it on first call.
@@ -238,6 +253,23 @@ def _quiet_docling_noise():
     if _DOCLING_LOGS_QUIETED:
         return
     _DOCLING_LOGS_QUIETED = True
+
+    # Kill the per-model "Loading weights" tqdm bar (emitted by transformers when
+    # docling loads its layout model) and HuggingFace hub progress bars. Without
+    # this the console is spammed once per converter build. Best-effort — never let
+    # a missing/renamed API break conversion.
+    import os as _os
+    _os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+    try:
+        from transformers.utils.logging import disable_progress_bar as _tf_dpb
+        _tf_dpb()
+    except Exception:
+        pass
+    try:
+        from huggingface_hub.utils import disable_progress_bars as _hf_dpb
+        _hf_dpb()
+    except Exception:
+        pass
 
     import logging as _logging
 
@@ -367,78 +399,102 @@ def _extract_with_docling(pdf_path: Path, config: Config) -> tuple:
             f"docling not installed. Install with: pip install docling  (import error: {e})"
         )
 
-    # Build pipeline options.
+    # OCR is OFF on the primary docling pass. This corpus — and most born-digital
+    # PDFs — has a real text layer, so per-page Tesseract OCR is wasted CPU and was
+    # the dominant cost / throughput bottleneck. If the no-OCR pass yields
+    # suspiciously little text (a scanned / image-only PDF), we transparently
+    # re-run docling WITH OCR below — i.e. OCR fires ONLY when the original
+    # conversion's quality is low. Force OCR on the primary pass with
+    # PDF4LLM_DOCLING_PRIMARY_OCR=1.
     #
-    # OCR engine selection:
-    #   We explicitly use TesseractCliOcrOptions (tesseract CLI binary, which
-    #   pdf4llm already depends on for its own OCR fallback) instead of the
-    #   default rapidocr. rapidocr has a bug on current versions where it
-    #   assigns a PosixPath to an OmegaConf config field that rejects non-
-    #   primitive types (omegaconf.errors.UnsupportedValueType:
-    #   "Value 'PosixPath' is not a supported primitive type, full_key:
-    #   Global.model_root_dir"). Tesseract CLI bypasses this.
-    #
-    # do_ocr stays TRUE so we get full OCR coverage on image-embedded text
-    # (tables rendered as images, equation labels, scanned pages).
-    #
-    # We also explicitly force the accelerator device (CPU unless user opted
-    # into GPU) because docling's default probing can crash with
-    # `libnvrtc-builtins.so.13.0 not found` on CUDA-installed-but-incomplete
-    # systems.
+    # OCR engine: TesseractCliOcrOptions (tesseract CLI binary, which pdf4llm
+    # already depends on) instead of the default rapidocr, which has an OmegaConf
+    # PosixPath bug on current versions. We also force the accelerator device
+    # explicitly because docling's default probing can crash with
+    # `libnvrtc-builtins.so.13.0 not found` on CUDA-installed-but-incomplete systems.
     ocr_options = TesseractCliOcrOptions()
+    accel_device = AcceleratorDevice.CUDA if use_gpu else AcceleratorDevice.CPU
 
-    if use_gpu:
-        accel = AcceleratorOptions(device=AcceleratorDevice.CUDA)
-        pipeline_options = ThreadedPdfPipelineOptions(
-            accelerator_options=accel,
-            layout_batch_size=64,
-            ocr_batch_size=64,
-            do_ocr=True,
-            ocr_options=ocr_options,
-            generate_picture_images=False,
-        )
-    else:
-        accel = AcceleratorOptions(device=AcceleratorDevice.CPU)
-        pipeline_options = PdfPipelineOptions(
-            accelerator_options=accel,
-            do_ocr=True,
-            ocr_options=ocr_options,
-            generate_picture_images=False,
-        )
+    def _build_converter(do_ocr: bool):
+        accel = AcceleratorOptions(device=accel_device)
+        if use_gpu:
+            pipeline_options = ThreadedPdfPipelineOptions(
+                accelerator_options=accel,
+                layout_batch_size=64,
+                ocr_batch_size=64,
+                do_ocr=do_ocr,
+                ocr_options=ocr_options,
+                generate_picture_images=False,
+            )
+        else:
+            pipeline_options = PdfPipelineOptions(
+                accelerator_options=accel,
+                do_ocr=do_ocr,
+                ocr_options=ocr_options,
+                generate_picture_images=False,
+            )
+        format_options = {
+            InputFormat.PDF: FormatOption(
+                pipeline_options=pipeline_options,
+                backend=DoclingParseDocumentBackend,
+                pipeline_cls=StandardPdfPipeline,
+            ),
+        }
+        # Reuse a cached converter per (device, do_ocr, thread) so docling's model
+        # loads once per worker instead of once per PDF. Double-checked locking
+        # keeps the build single-flight.
+        key = (use_gpu, do_ocr, _threading.get_ident())
+        conv = _CONVERTER_CACHE.get(key)
+        if conv is None:
+            with _CONVERTER_CACHE_LOCK:
+                conv = _CONVERTER_CACHE.get(key)
+                if conv is None:
+                    conv = DocumentConverter(format_options=format_options)
+                    _CONVERTER_CACHE[key] = conv
+        return conv
 
-    format_options = {
-        InputFormat.PDF: FormatOption(
-            pipeline_options=pipeline_options,
-            backend=DoclingParseDocumentBackend,
-            pipeline_cls=StandardPdfPipeline,
-        ),
-    }
-    converter = DocumentConverter(format_options=format_options)
-
-    # Convert — raises_on_error=False so we get partial results on recoverable errors.
-    # The GPU slot (if claimed) is released as soon as converter.convert returns,
-    # BEFORE the cheap markdown post-processing below. That way the next waiting
-    # worker can start its own CUDA conversion while this thread keeps processing
-    # the extracted document in Python.
-    try:
+    def _run(do_ocr: bool) -> str:
+        """One docling pass; returns exported markdown ('' if no document)."""
+        conv = _build_converter(do_ocr)
         try:
-            result = converter.convert(pdf_path, raises_on_error=False)
+            res = conv.convert(pdf_path, raises_on_error=False)
         except Exception as e:
             raise RuntimeError(f"docling convert failed: {e}")
+        if res is None or res.document is None:
+            return ""
+        md = res.document.export_to_markdown()
+        # Free per-document page/image state; the cached converter is KEPT so its
+        # model isn't reloaded on the next PDF.
+        del res
+        return md or ""
+
+    # The GPU slot (if claimed) stays held across both passes and is released in
+    # the finally below, before the cheap markdown post-processing.
+    doc_obj = None  # docling doc not retained (title falls back to first H1 below)
+    primary_ocr = os.environ.get("PDF4LLM_DOCLING_PRIMARY_OCR", "").strip() not in ("", "0", "false", "False")
+    try:
+        md_text = _run(primary_ocr)
+        # Quality gate: a sparse no-OCR result => likely scanned/image-only => retry
+        # once WITH OCR and keep it if it recovers more text.
+        if not primary_ocr:
+            try:
+                import fitz as _fitz
+                with _fitz.open(pdf_path) as _doc:
+                    n_pages = max(1, _doc.page_count)
+            except Exception:
+                n_pages = 1
+            if len((md_text or "").strip()) < _DOCLING_OCR_MIN_CHARS_PER_PAGE * n_pages:
+                try:
+                    md_ocr = _run(True)
+                    if len(md_ocr.strip()) > len((md_text or "").strip()):
+                        logger.info(f"docling OCR retry recovered text for {pdf_path.name}")
+                        md_text = md_ocr
+                except Exception as e:
+                    logger.info(f"docling OCR retry failed for {pdf_path.name}: {e}")
     finally:
         if gpu_claimed:
             _get_gpu_slot().release()
             gpu_claimed = False
-
-    if result is None or result.document is None:
-        raise RuntimeError("docling produced no document")
-
-    doc_obj = result.document
-    md_text = doc_obj.export_to_markdown()
-    # Release docling's intermediate page/image data immediately — the docling
-    # ConversionResult and DocumentConverter both hold heavy in-memory state
-    # (page images, model tensors) that won't release until GC otherwise.
-    del doc_obj, result, converter
 
     if not md_text or len(md_text.strip()) < 20:
         raise RuntimeError("docling produced empty or trivially small markdown")
@@ -564,14 +620,37 @@ def _try_grobid(pdf_path: Path, config: Config) -> tuple:
         return None, None, e
 
 
+# Cache a hard docling import/load failure so we don't re-trigger the (slow, noisy)
+# import chain for every PDF. Once docling proves unimportable in this process
+# (e.g. a NumPy 2.x vs TensorFlow ABI clash, or a broken transformers/docling
+# install), every subsequent call short-circuits straight to the GROBID/pymupdf
+# fallback with no traceback spam and no wasted re-import.
+_DOCLING_LOAD_FAILED = None
+
+
 def _try_docling(pdf_path: Path, config: Config) -> tuple:
     """Run docling, returning (document, exception)."""
+    global _DOCLING_LOAD_FAILED
+    if _DOCLING_LOAD_FAILED is not None:
+        return None, _DOCLING_LOAD_FAILED
     try:
         doc, raw_md = _extract_with_docling(pdf_path, config)
         # Stash raw markdown on the doc for later references.md extraction
         doc._docling_raw_md = raw_md
         return doc, None
     except Exception as e:
+        # An import/ABI failure means docling will NEVER work this run — cache it
+        # so we stop re-importing per PDF. A per-document extraction error is NOT
+        # cached (docling loaded fine; just this one PDF failed).
+        msg = str(e).lower()
+        if isinstance(e, (ImportError, ModuleNotFoundError)) or any(
+            t in msg for t in (
+                "_array_api", "numpy.core", "failed to import",
+                "cannot import name", "no module named",
+                "docling not installed", "numpy 1.x",
+            )
+        ):
+            _DOCLING_LOAD_FAILED = e
         return None, e
 
 
