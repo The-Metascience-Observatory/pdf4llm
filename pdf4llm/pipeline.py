@@ -1926,6 +1926,10 @@ class BatchProcessor:
         try:
             # Sequential path (easier to debug)
             if self.config.workers == 1:
+                # Same unbounded-growth problem as the threaded path below: without
+                # a periodic collect, RSS climbs across a long batch until the
+                # process is killed. See the comment on _gc_every there.
+                _seq_since_gc = 0
                 for pdf_path in tqdm(pdfs, desc="Converting PDFs"):
                     if self._shutdown_requested:
                         logger.info("Shutdown requested — stopping sequential loop")
@@ -1940,6 +1944,11 @@ class BatchProcessor:
                             raise _build_grobid_oom_error(pdf_path.name, n_successful + n_partial + n_failed)
                         raise
                     _tally(result, pdf_path)
+                    del result
+                    _seq_since_gc += 1
+                    if _seq_since_gc >= 25:
+                        gc.collect()
+                        _seq_since_gc = 0
             else:
                 # Parallel processing — use a throttled sliding window so we
                 # never hold more than (workers * 4) completed futures in memory
@@ -1963,6 +1972,13 @@ class BatchProcessor:
                         return False
 
                 executor = ThreadPoolExecutor(max_workers=self.config.workers)
+                # Threads share one address space, so per-PDF allocations that
+                # only reference cycles can reach accumulate in the PARENT
+                # process. Over a long batch that shows up as steady RSS growth
+                # (measured: ~13.5 GB after ~1,900 PDFs, then the process dies
+                # with no traceback). Collecting every N completions bounds it.
+                _gc_every = 25
+                _since_gc = 0
                 try:
                     # Fill the initial window
                     for _ in range(max_in_flight):
@@ -1995,6 +2011,10 @@ class BatchProcessor:
                                 # Drop the future reference so the result can be GC'd,
                                 # then run GC periodically to release docling memory.
                                 del future
+                                _since_gc += 1
+                                if _since_gc >= _gc_every:
+                                    gc.collect()
+                                    _since_gc = 0
                                 progress.update(1)
                             # Submit one more to maintain the window
                             if not self._shutdown_requested:
