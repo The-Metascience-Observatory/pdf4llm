@@ -415,6 +415,12 @@ def _extract_with_docling(pdf_path: Path, config: Config) -> tuple:
     ocr_options = TesseractCliOcrOptions()
     accel_device = AcceleratorDevice.CUDA if use_gpu else AcceleratorDevice.CPU
 
+    # When --extract-images is on we ask docling to keep per-figure crops.
+    # get_image() crops from the rendered page raster, so generate_page_images
+    # must be on too or the crop source is missing and get_image() returns None.
+    want_images = bool(getattr(config, "extract_images", False))
+    images_scale = float(getattr(config, "images_scale", 2.0) or 2.0)
+
     def _build_converter(do_ocr: bool):
         accel = AcceleratorOptions(device=accel_device)
         if use_gpu:
@@ -424,15 +430,19 @@ def _extract_with_docling(pdf_path: Path, config: Config) -> tuple:
                 ocr_batch_size=64,
                 do_ocr=do_ocr,
                 ocr_options=ocr_options,
-                generate_picture_images=False,
+                generate_picture_images=want_images,
+                generate_page_images=want_images,
             )
         else:
             pipeline_options = PdfPipelineOptions(
                 accelerator_options=accel,
                 do_ocr=do_ocr,
                 ocr_options=ocr_options,
-                generate_picture_images=False,
+                generate_picture_images=want_images,
+                generate_page_images=want_images,
             )
+        if want_images:
+            pipeline_options.images_scale = images_scale
         format_options = {
             InputFormat.PDF: FormatOption(
                 pipeline_options=pipeline_options,
@@ -443,7 +453,10 @@ def _extract_with_docling(pdf_path: Path, config: Config) -> tuple:
         # Reuse a cached converter per (device, do_ocr, thread) so docling's model
         # loads once per worker instead of once per PDF. Double-checked locking
         # keeps the build single-flight.
-        key = (use_gpu, do_ocr, _threading.get_ident())
+        # `want_images`/`images_scale` are part of the key: a converter built
+        # with images off must not be reused for an --extract-images run (it
+        # would silently yield zero figures), and vice-versa.
+        key = (use_gpu, do_ocr, want_images, images_scale, _threading.get_ident())
         conv = _CONVERTER_CACHE.get(key)
         if conv is None:
             with _CONVERTER_CACHE_LOCK:
@@ -452,6 +465,45 @@ def _extract_with_docling(pdf_path: Path, config: Config) -> tuple:
                     conv = DocumentConverter(format_options=format_options)
                     _CONVERTER_CACHE[key] = conv
         return conv
+
+    # Figure crops harvested from the docling result, as (PIL.Image, caption).
+    # Collected inside _run while `res` is still alive; only the small crops are
+    # retained, never the full-page rasters.
+    harvested_images: list = []
+
+    def _harvest_images(res) -> None:
+        """Pull per-figure crops out of a docling result before it is freed."""
+        harvested_images.clear()
+        try:
+            from docling_core.types.doc import PictureItem
+        except Exception as e:
+            logger.warning(f"cannot import PictureItem for image extraction: {e}")
+            return
+        doc = res.document
+        for element, _level in doc.iterate_items():
+            if not isinstance(element, PictureItem):
+                continue
+            try:
+                # Crops from the RENDERED page, so vector figures are captured.
+                img = element.get_image(doc)
+            except Exception as e:
+                logger.warning(f"failed to get image for figure: {e}")
+                continue
+            if img is None:
+                continue  # no provenance, or page images were not generated
+            try:
+                caption = element.caption_text(doc) or None
+            except Exception:
+                caption = None
+            page_no = None
+            try:
+                if element.prov:
+                    page_no = element.prov[0].page_no
+            except Exception:
+                pass
+            # copy() detaches the crop from the parent page raster so the big
+            # page image can be garbage-collected with the result.
+            harvested_images.append((img.copy(), caption, page_no))
 
     def _run(do_ocr: bool) -> str:
         """One docling pass; returns exported markdown ('' if no document)."""
@@ -463,6 +515,11 @@ def _extract_with_docling(pdf_path: Path, config: Config) -> tuple:
         if res is None or res.document is None:
             return ""
         md = res.document.export_to_markdown()
+        if want_images:
+            try:
+                _harvest_images(res)
+            except Exception as e:
+                logger.warning(f"image extraction failed for {pdf_path.name}: {e}")
         # Free per-document page/image state; the cached converter is KEPT so its
         # model isn't reloaded on the next PDF.
         del res
@@ -569,6 +626,10 @@ def _extract_with_docling(pdf_path: Path, config: Config) -> tuple:
         abstract=abstract,
         sections=sections,
     )
+    # Carry the harvested figure crops out-of-band (same convention as
+    # _docling_raw_md) so the tuple shape and its call sites stay unchanged.
+    if want_images and harvested_images:
+        doc._docling_images = list(harvested_images)
     return doc, md_text
 
 
@@ -721,6 +782,12 @@ def _merge_grobid_docling(grobid_doc: DocumentModel, docling_doc: DocumentModel)
     raw_md = getattr(docling_doc, "_docling_raw_md", None)
     if raw_md is not None:
         merged._docling_raw_md = raw_md
+
+    # Likewise carry the harvested figure crops (--extract-images) onto the
+    # merged doc; only the docling side ever has them.
+    docling_images = getattr(docling_doc, "_docling_images", None)
+    if docling_images:
+        merged._docling_images = docling_images
 
     return merged
 
@@ -1233,7 +1300,12 @@ def convert_single(
                 # Use OCR result if it's better than GROBID result
                 if ocr_score > quality_score:
                     logger.info(f"OCR fallback improved quality: {quality_score:.2f} -> {ocr_score:.2f}")
+                    # Carry the docling figure crops across the swap; the OCR
+                    # document has no images of its own and would drop them.
+                    _carried_images = getattr(document, "_docling_images", None)
                     document = ocr_document
+                    if _carried_images:
+                        document._docling_images = _carried_images
                     document.metadata.quality_score = ocr_score
                     document.metadata.quality_issues = ocr_issues
                     warnings.append(f"OCR fallback used (quality improved from {quality_score:.2f} to {ocr_score:.2f})")
@@ -1350,6 +1422,35 @@ def convert_single(
             refs_path.write_text(refs_json, encoding="utf-8")
             if refs_md_text is not None:
                 refs_md_path.write_text(refs_md_text, encoding="utf-8")
+
+            # Save extracted figure images (--extract-images). No vision model,
+            # no network: the crops were harvested during the docling pass and
+            # are written here, once the rest of the output is known-good.
+            if getattr(config, "extract_images", False):
+                harvested = getattr(document, "_docling_images", None) or []
+                if not harvested:
+                    warnings.append(
+                        "--extract-images: no figures saved (docling's layout model found "
+                        "no Picture regions, or docling was not the extractor used for this PDF)"
+                    )
+                else:
+                    saved_figures = []
+                    for idx, (img, caption, page_no) in enumerate(harvested, start=1):
+                        try:
+                            page_part = f"page_{page_no}_" if page_no is not None else ""
+                            img_path = effective_output_dir / f"{page_part}img_{idx}.png"
+                            img.save(img_path, "PNG")
+                            saved_figures.append(
+                                Figure(id=f"img_{idx}", caption=caption, page_number=page_no)
+                            )
+                        except Exception as e:
+                            warnings.append(f"Failed to save image {idx}: {e}")
+                    # Don't clobber richer figure data from another extractor.
+                    if saved_figures and not document.figures:
+                        document.figures = saved_figures
+                    logger.info(
+                        f"Saved {len(saved_figures)} images to {effective_output_dir}"
+                    )
 
             # Write provenance.json recording which extractor produced what
             try:

@@ -98,6 +98,15 @@ class Config:
     chart_model: Optional[str] = None  # Model name (default: llava:13b for ollama)
     ollama_url: str = "http://localhost:11434"
 
+    # Plain image extraction (no vision model, no network, no cost).
+    # Saves each figure as its own PNG via docling's layout model, which crops
+    # the RENDERED page region -- so vector figures (matplotlib/R plots) are
+    # captured, unlike charts.py's PyMuPDF embedded-raster scan.
+    extract_images: bool = False
+    # Render scale for cropped figures: 1.0 == 72 DPI, so 2.0 == 144 DPI.
+    # Memory cost grows quadratically; 2.0 is a good default for figure crops.
+    images_scale: float = 2.0
+
     # Logging
     verbose: bool = False
 

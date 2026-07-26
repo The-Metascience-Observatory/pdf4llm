@@ -402,6 +402,14 @@ def cli():
 @click.option("--save-tei", is_flag=True, help="Save raw TEI XML")
 @click.option("--extract-charts", is_flag=True,
               help="Extract and analyze charts/figures using vision model (requires Ollama)")
+@click.option("--extract-images", is_flag=True,
+              help="Save each figure as a separate PNG in the output folder. Free and "
+                   "local: no vision model, no Ollama, no API cost. Uses docling's layout "
+                   "model, which crops the rendered page, so vector figures (matplotlib/R "
+                   "plots) are captured too.")
+@click.option("--images-scale", type=float, default=2.0, show_default=True,
+              help="Render scale for --extract-images (1.0 = 72 DPI, 2.0 = 144 DPI). "
+                   "Raise for sharper figure crops; memory grows quadratically.")
 @click.option("--chart-model", default=None,
               help="Vision model for chart analysis (default: llava:13b)")
 @click.option("--ollama-url", default="http://localhost:11434",
@@ -450,7 +458,8 @@ def cli():
               help="Force docling off of GPU (CPU only). Opt-out for auto-enabled default.")
 @click.option("-v", "--verbose", is_flag=True, help="Verbose output")
 def convert(pdf_path, output_dir, mode, grobid_url, no_json, save_tei,
-            extract_charts, chart_model, ollama_url, grobid_home, no_auto_grobid,
+            extract_charts, extract_images, images_scale,
+            chart_model, ollama_url, grobid_home, no_auto_grobid,
             use_docker, docker_mode, movepdf, run_without_delft, extract_abstract_only,
             single_markdown, noocr,
             no_crossref, use_docling, no_parallel, no_marker_fallback, no_pymupdf_fallback,
@@ -469,6 +478,14 @@ def convert(pdf_path, output_dir, mode, grobid_url, no_json, save_tei,
 
     if extract_abstract_only and single_markdown:
         raise click.BadParameter("--extract-abstract-only and --single-markdown are mutually exclusive.")
+
+    # Image extraction rides on the docling pass, which --mode fast skips.
+    if extract_images and ExtractionMode.from_string(mode) == ExtractionMode.FAST:
+        click.secho(
+            "--extract-images has no effect with --mode fast (docling does not run "
+            "in that mode). Use the default mode, or --docling-only.",
+            fg="yellow",
+        )
 
     # Check Ollama if chart extraction requested
     if extract_charts:
@@ -492,6 +509,8 @@ def convert(pdf_path, output_dir, mode, grobid_url, no_json, save_tei,
         output_json=not no_json,
         output_tei=save_tei,
         extract_charts=extract_charts,
+        extract_images=extract_images,
+        images_scale=images_scale,
         chart_model=chart_model,
         ollama_url=ollama_url,
         abstract_only=extract_abstract_only,
