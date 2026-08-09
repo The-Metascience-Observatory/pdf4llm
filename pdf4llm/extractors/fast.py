@@ -727,14 +727,16 @@ def _extract_doi_from_filename(pdf_path: Path) -> Optional[str]:
       - 10.1002--jnr.22753.pdf               -> 10.1002/jnr.22753
       - 10.1093--rheumatology--kew394.pdf    -> 10.1093/rheumatology/kew394
       - 110.1002--smj.2585.pdf               -> 10.1002/smj.2585 (spurious leading digit)
+      - 10.1023--a~1018769825030.pdf         -> 10.1023/a:1018769825030
     """
     stem = pdf_path.stem
     # Match leading DOI prefix (optionally after spurious leading digits),
-    # then replace ALL remaining `--` in the suffix with `/`.
+    # then decode the suffix with the shared codec ('--' -> '/', '~' -> ':',
+    # '~XX~' hex tokens, '~2d~' escaped hyphens).
     match = re.match(r"^\d*(10\.\d{4,})--(.+)$", stem)
     if match:
-        suffix = match.group(2).replace("--", "/")
-        return f"{match.group(1)}/{suffix}"
+        from ..doi_codec import slug_to_doi
+        return f"{match.group(1)}/{slug_to_doi(match.group(2))}"
     return None
 
 
