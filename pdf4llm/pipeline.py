@@ -812,6 +812,7 @@ def convert_single(
     output_dir: Path,
     config: Config,
     output_subdir_name: Optional[str] = None,
+    output_prefix: Optional[str] = None,
 ) -> ProcessingResult:
     """
     Convert a single PDF to Markdown and JSON.
@@ -823,6 +824,11 @@ def convert_single(
         output_subdir_name: Override for the per-PDF output subfolder name.
             Defaults to the PDF's stem. Used by batch processing to
             disambiguate stem collisions (e.g. multiple ``paper.pdf`` files).
+            Pass ``""`` to write directly into ``output_dir`` with no subfolder.
+        output_prefix: Prepended to every output filename (``abstract.md`` ->
+            ``{prefix}abstract.md``). Lets several PDFs -- a paper and its
+            supplementary files -- share one directory without colliding.
+            Defaults to no prefix, reproducing the historical bare names.
 
     Returns:
         ProcessingResult with status and output paths
@@ -836,7 +842,9 @@ def convert_single(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     stem = pdf_path.stem
-    subdir_name = output_subdir_name or stem
+    # `is None` rather than falsy: "" is a meaningful value meaning "no subfolder,
+    # write into output_dir directly", which `or stem` would silently override.
+    subdir_name = stem if output_subdir_name is None else output_subdir_name
     document = None
     tei_xml = None
     docling_raw_md = None
@@ -1271,17 +1279,24 @@ def convert_single(
     # NOTE: we do NOT create the folder here — we create it lazily right
     # before writing the first output file, so that failed/crashed extractions
     # don't leave empty "phantom" folders behind.
-    if document:
+    if document and subdir_name:
         effective_output_dir = output_dir / subdir_name
     else:
         effective_output_dir = output_dir
 
-    abstract_path = effective_output_dir / "abstract.md"
-    body_path = effective_output_dir / "body.md"
-    refs_path = effective_output_dir / "references.json"
-    refs_md_path = effective_output_dir / "references.md"
-    tei_path = effective_output_dir / f"{stem}.tei.xml"
-    provenance_path = effective_output_dir / "provenance.json"
+    # `output_prefix` prepends a stem to every output name, so a paper and its
+    # supplementary PDFs can share one directory without colliding or nesting:
+    #   10.1073--pnas.123_from_pdf_body.md
+    #   10.1073--pnas.123_supplementary_info_1_x_from_pdf_body.md
+    # Empty by default, which reproduces the historical bare names exactly.
+    # Note tei_path was already stem-prefixed; this just makes the six uniform.
+    prefix = f"{output_prefix}" if output_prefix else ""
+    abstract_path = effective_output_dir / f"{prefix}abstract.md"
+    body_path = effective_output_dir / f"{prefix}body.md"
+    refs_path = effective_output_dir / f"{prefix}references.json"
+    refs_md_path = effective_output_dir / f"{prefix}references.md"
+    tei_path = effective_output_dir / (f"{prefix}tei.xml" if prefix else f"{stem}.tei.xml")
+    provenance_path = effective_output_dir / f"{prefix}provenance.json"
 
     # Validate extraction quality
     if document:
@@ -2171,9 +2186,12 @@ def _process_single_wrapper(
     output_dir: Path,
     config: Config,
     output_subdir_name: Optional[str] = None,
+    output_prefix: Optional[str] = None,
 ) -> ProcessingResult:
     """Wrapper for convert_single to work with ProcessPoolExecutor."""
-    return convert_single(pdf_path, output_dir, config, output_subdir_name=output_subdir_name)
+    return convert_single(pdf_path, output_dir, config,
+                          output_subdir_name=output_subdir_name,
+                          output_prefix=output_prefix)
 
 
 def check_grobid_health(config: Config) -> dict:
