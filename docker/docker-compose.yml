@@ -13,7 +13,11 @@ services:
     environment:
       - JAVA_OPTS=-Xmx6g -Xms2g
     healthcheck:
-      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8070/api/isalive', timeout=5)\""]
+      # The image has no curl/wget/python3 -- only bash. The previous check
+      # shelled out to python3 and so exited 127 forever, marking the container
+      # permanently "unhealthy" no matter what GROBID was doing. bash's
+      # /dev/tcp needs nothing extra.
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/8070 && printf 'GET /api/isalive HTTP/1.0\r\n\r\n' >&3 && grep -q true <&3"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -30,7 +34,11 @@ services:
     environment:
       - JAVA_OPTS=-Xmx4g -Xms2g
     healthcheck:
-      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8070/api/isalive', timeout=5)\""]
+      # The image has no curl/wget/python3 -- only bash. The previous check
+      # shelled out to python3 and so exited 127 forever, marking the container
+      # permanently "unhealthy" no matter what GROBID was doing. bash's
+      # /dev/tcp needs nothing extra.
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/8070 && printf 'GET /api/isalive HTTP/1.0\r\n\r\n' >&3 && grep -q true <&3"]
       interval: 30s
       timeout: 10s
       retries: 3
