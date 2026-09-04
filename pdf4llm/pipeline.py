@@ -37,6 +37,8 @@ from .renderers.markdown import render_abstract_md, render_body_md, render_singl
 from .renderers.json_output import render_references_json
 from .validation import validate_document
 
+from .table_serializer import export_markdown_html_tables
+
 logger = logging.getLogger(__name__)
 
 # Path to the docker-compose.yml bundled with this package
@@ -515,7 +517,10 @@ def _extract_with_docling(pdf_path: Path, config: Config) -> tuple:
             raise RuntimeError(f"docling convert failed: {e}")
         if res is None or res.document is None:
             return ""
-        md = res.document.export_to_markdown()
+        # Tables as embedded HTML, not markdown pipe tables: pipe tables cannot
+        # express rowspan/colspan, and a flattened merged header silently
+        # reassigns a value to the wrong column. See table_serializer.py.
+        md = export_markdown_html_tables(res.document)
         if want_images:
             try:
                 _harvest_images(res)
@@ -1467,6 +1472,19 @@ def convert_single(
                     logger.info(
                         f"Saved {len(saved_figures)} images to {effective_output_dir}"
                     )
+
+            # Which table rendering body.md actually got. The mode string says
+            # WHICH ENGINE ran, not how its tables were serialized, so without
+            # this a pipe-table body and an HTML-table body are
+            # indistinguishable after the fact -- and provenance.json is the
+            # only durable record of conversion quality (see docling_guard).
+            _body_probe = locals().get("body_md") or ""
+            if _body_probe:
+                provenance["table_format"] = (
+                    "html" if "<table" in _body_probe.lower()
+                    else ("pipe" if any(
+                        l.lstrip().startswith("|") for l in _body_probe.splitlines())
+                        else "none"))
 
             # Write provenance.json recording which extractor produced what
             try:
