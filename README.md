@@ -77,23 +77,48 @@ This lets downstream consumers (LLM extraction pipelines, analysis scripts) know
 
 The default `--mode full-grobid` uses the following extraction cascade. Disabled or unavailable fallback tiers are skipped:
 
-```text
-PDF → GROBID + docling in parallel
-      │         └─ sparse text (<100 characters/page on average)
-      │            → retry docling with Tesseract OCR; keep the longer result
-      │
-      ├─ both succeed       → merge best fields from each
-      ├─ only GROBID works  → GROBID-only document
-      ├─ only docling works → docling-only document
-      └─ both fail          → marker-pdf
-                              ├─ succeeds → marker document
-                              └─ fails / unavailable / disabled → pymupdf4llm
-                                                                   ├─ succeeds → best-effort document
-                                                                   └─ fails / disabled → failed
+```mermaid
+flowchart TD
+    PDF["PDF · default parallel mode"] --> G["GROBID"]
+    PDF --> D["docling · text-first pass"]
+    D --> SP{"Sparse text?<br/>Under 100 characters/page"}
+    SP -->|Yes| DOCR["Retry docling with Tesseract OCR<br/>Keep the longer result"]
+    SP -->|No| RESULTS{"Extraction results"}
+    DOCR --> RESULTS
+    G --> RESULTS
+    RESULTS -->|Both succeed| MERGE["Merge best fields from each"]
+    RESULTS -->|Only GROBID succeeds| GDOC["GROBID-only document"]
+    RESULTS -->|Only docling succeeds| DDOC["docling-only document"]
+    RESULTS -->|Both fail| M["marker-pdf<br/>Uses its own OCR engine"]
+    M -->|Succeeds| REC["Recovered document"]
+    M -->|Fails, unavailable, or disabled| P["pymupdf4llm<br/>Final extractor fallback"]
+    P -->|Succeeds| REC
+    P -->|Fails, unavailable, or disabled| FAIL["Failed · recorded for a later retry"]
+    MERGE --> REC
+    GDOC --> REC
+    DDOC --> REC
 
-Recovered document → DOI/title recovery → quality/body OCR checks
-                   → reference enrichment → output files
+    SEQ["PDF · --no-parallel"] --> SG["GROBID"]
+    SG -->|Succeeds| REC
+    SG -->|Scanned PDF or recoverable error| SOCR["PyMuPDF + Tesseract OCR fallback"]
+    SOCR -->|Recovers document| REC
+    SOCR -->|Fails or --noocr| FAIL
+
+    REC --> META["Recover missing DOI from filename<br/>Recover missing or invalid title via DOI APIs"]
+    META --> FORMAT{"Output mode"}
+    FORMAT -->|Single Markdown or abstract only| EARLY["Write output · return early"]
+    FORMAT -->|Normal split output| Q{"Quality below 0.6<br/>and no table structure?<br/>OCR enabled?"}
+    Q -->|Yes| QOCR["PyMuPDF + Tesseract OCR fallback<br/>Replace only if score improves by more than 0.1"]
+    Q -->|No| BODY{"Full-grobid, non-OCR document?<br/>Body under 2,000 characters, PDF over 1 page?<br/>OCR enabled?"}
+    QOCR --> BODY
+    BODY -->|Yes| BOCR["PyMuPDF + Tesseract OCR fallback<br/>Replace only if the body is longer"]
+    BODY -->|No| REFS["Enrich OCR references via GROBID when applicable<br/>Enrich missing reference DOIs via Crossref"]
+    BOCR --> REFS
+    REFS --> OUT["Write output files"]
 ```
+
+**OCR engine:** the PyMuPDF + Tesseract fallback reads each page's text layer first, then uses Tesseract on pages with fewer than 100 text characters. `--noocr` skips the sequential and shared OCR fallbacks; docling's internal OCR retry and marker's own OCR remain enabled.
+
 
 Marker and pymupdf4llm do not produce structured references; prose references can still be written when found. A complete extraction failure is recorded for retry on a later run; there is no additional whole-document OCR tier after all parallel extractors fail. Detected GROBID connection/server crashes propagate to stop processing rather than continuing the normal per-PDF cascade.
 
