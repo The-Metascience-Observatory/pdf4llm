@@ -30,7 +30,7 @@ By running GROBID and docling in parallel and taking the best output from each, 
 
 ## Output layout
 
-Each converted PDF produces a subfolder named by its file stem:
+By default, each converted PDF produces a subfolder named by its file stem:
 
 ```
 {stem}/
@@ -38,7 +38,7 @@ Each converted PDF produces a subfolder named by its file stem:
 ├── abstract.md           # title + abstract (GROBID)
 ├── body.md               # main text with sections and inline tables (docling)
 ├── references.json       # structured [{authors, title, journal, year, doi, …}, …] (GROBID)
-├── references.md         # references section as prose markdown (docling)
+├── references.md         # optional prose references (docling/marker/pymupdf4llm)
 └── provenance.json       # per-field attribution: which extractor produced which file
 ```
 
@@ -75,33 +75,59 @@ This lets downstream consumers (LLM extraction pipelines, analysis scripts) know
 
 ## Fallback chain
 
-When a PDF is processed in `--mode full-grobid` (the default), pdf4llm follows this cascade:
+The default `--mode full-grobid` uses the following extraction cascade. Disabled or unavailable fallback tiers are skipped:
 
-```
-             ┌─── GROBID succeeds + docling succeeds → merge-best-of-each
-             │
-PDF ─────────┼─── only GROBID succeeds              → GROBID-only output
-             │
-             ├─── only docling succeeds              → docling-only output
-             │                                         (references.json may be empty)
-             │
-             └─── both fail → marker-pdf             → marker-fallback output
-                                   │                   (references.json empty)
-                                   │
-                                   └─ marker fails → pymupdf4llm    ← last-resort
-                                                        │            (flat markdown
-                                                        │             only; refs/tables
-                                                        │             empty)
-                                                        │
-                                                        └─ pymupdf4llm fails → failed,
-                                                                               logged for
-                                                                               retry
+```text
+PDF → GROBID + docling in parallel
+      │         └─ sparse text (<100 characters/page on average)
+      │            → retry docling with Tesseract OCR; keep the longer result
+      │
+      ├─ both succeed       → merge best fields from each
+      ├─ only GROBID works  → GROBID-only document
+      ├─ only docling works → docling-only document
+      └─ both fail          → marker-pdf
+                              ├─ succeeds → marker document
+                              └─ fails / unavailable / disabled → pymupdf4llm
+                                                                   ├─ succeeds → best-effort document
+                                                                   └─ fails / disabled → failed
+
+Recovered document → DOI/title recovery → quality/body OCR checks
+                   → reference enrichment → output files
 ```
 
-- `--no-parallel` forces sequential single-extractor mode (GROBID + OCR fallback only). Use for debugging.
-- `--no-marker-fallback` disables the marker tier.
-- `--no-pymupdf-fallback` disables the pymupdf4llm last-resort tier.
-- `--docling-only` disables GROBID entirely. Use if you don't need structured references or GROBID is unavailable.
+Marker and pymupdf4llm do not produce structured references; prose references can still be written when found. A complete extraction failure is recorded for retry on a later run; there is no additional whole-document OCR tier after all parallel extractors fail. Detected GROBID connection/server crashes propagate to stop processing rather than continuing the normal per-PDF cascade.
+
+### Other extraction paths
+
+| Mode | Extraction and fallback behavior |
+|---|---|
+| `--no-parallel` | GROBID → PyMuPDF/Tesseract OCR on a scanned-PDF or other recoverable GROBID error → failed if no document is recovered. No marker or pymupdf4llm tier. |
+| `--docling-only` | docling, including its internal sparse-text OCR retry → failed if docling fails. No GROBID extraction, marker, or pymupdf4llm tier. |
+| `--mode hybrid` | PyMuPDF + pdfplumber → GROBID for a deficient title, abstract, DOI, or missing/low-quality tables (threshold: `0.8`). Prefer GROBID references when available; retain the fast result if GROBID fails. |
+| `--mode fast` | PyMuPDF + pdfplumber; no GROBID extraction. The shared recovery steps below still apply. |
+
+### Recovery and enrichment after extraction
+
+These steps run on an existing document, in this order:
+
+1. **Missing DOI:** try decoding a DOI from the PDF filename.
+2. **Missing or invalid title:** when a DOI is available, try **Crossref → DataCite → Unpaywall → Semantic Scholar → OpenAlex**, stopping at the first returned title. Lookups are cached for the process. The fast extractor also uses this title lookup when local title extraction fails.
+3. **Low extraction quality:** when the quality score is below `0.6`, try PyMuPDF/Tesseract OCR unless the document has recovered table structure. Replace the document only if the score improves by more than `0.1`; otherwise keep the original.
+4. **Very short body:** in `full-grobid` mode, a non-OCR document with fewer than `2,000` rendered body characters and more than one PDF page gets an OCR retry. Keep the OCR document only if its body is longer. This check can replace tables because the existing body is already severely incomplete.
+5. **OCR reference recovery:** when the mode requires GROBID and the recovered document is marked as OCR, re-parse eligible raw references through GROBID's citation parser if the server is available; keep original references when parsing fails.
+6. **Missing reference DOIs:** when fewer than 50% of references have DOIs, query Crossref for eligible references missing a DOI. Require a valid query title, a Crossref relevance score of at least `80`, and publication years within one year when both are available. The threshold is configurable through `Config.crossref_enrich_threshold`.
+7. **Prose references output:** try the retained docling/marker references markdown, then marker's full markdown, then pymupdf4llm's saved references or full markdown. Write `references.md` only if a references section is found.
+
+The PyMuPDF/Tesseract recovery routine first reads each page's text layer and uses image OCR for pages with fewer than 100 text characters. It does not recover table structure. `--single-markdown` and `--extract-abstract-only` return after DOI/title recovery, before the shared quality checks and reference enrichment.
+
+### Fallback controls
+
+- `--no-marker-fallback` skips marker; pymupdf4llm can still run.
+- `--no-pymupdf-fallback` disables the final extractor tier in the parallel cascade.
+- `--noocr` disables the sequential GROBID-error OCR fallback and shared quality/body OCR retries. It **does not disable docling's internal OCR retry or marker's OCR**.
+- `PDF4LLM_DOCLING_PRIMARY_OCR=1` enables OCR on docling's first pass instead of waiting for sparse-text recovery.
+- `--no-crossref` disables reference DOI enrichment. It does **not** disable the separate DOI-based title lookup chain.
+- `--no-parallel` and `--docling-only` select the alternative paths above.
 
 ---
 
@@ -130,6 +156,8 @@ pip install -e .
 
 On Ubuntu 24+, you may need `--break-system-packages` or a venv due to PEP 668. The package installs `pdf4llm` as a CLI command into `~/.local/bin/` (or your venv's `bin/`).
 
+The `pdf4llm` launcher respects an activated virtual environment. Otherwise it prompts on first run to create an isolated environment (default: `.venv` in the checkout), installs dependencies there, and saves its location in `~/.pdf4llm/config.json`. Install optional packages such as marker in that same environment. Launcher options include `--venv PATH`, `--venv-status`, `--reinstall-venv`, and `--no-venv` (use the current interpreter).
+
 ### 2. Install Tesseract OCR (required for fallback + docling OCR engine)
 
 pdf4llm uses Tesseract for two things:
@@ -144,12 +172,12 @@ sudo apt-get install tesseract-ocr
 brew install tesseract
 ```
 
-### 3. Install docling (for the parallel merge default)
+### 3. Verify docling (installed as a core dependency)
+
+`pip install -e .` already installs docling. If it is missing, install it in the environment used by pdf4llm:
 
 ```bash
-pip install --user docling
-# or, if you hit PEP 668:
-pip install --user --break-system-packages docling
+python -m pip install docling
 ```
 
 **Pinned version note:** docling versions above 2.76.0 (at time of writing) have broken `rapidocr` config handling. pdf4llm works around this by explicitly using `TesseractCliOcrOptions`, so any recent docling should work, but if you see `UnsupportedValueType: Value 'PosixPath' is not a supported primitive type`, it means rapidocr is being picked up — check the troubleshooting section below.
@@ -157,7 +185,7 @@ pip install --user --break-system-packages docling
 ### 4. Install marker-pdf (optional — primary fallback after GROBID+docling)
 
 ```bash
-pip install --user marker-pdf
+python -m pip install ".[marker]"
 ```
 
 First use downloads several GB of layout/OCR models to `~/.cache/datalab/models/`. After download, marker runs entirely offline and CPU-only. Models load once per process (~90 s first time, ~2 s subsequent).
@@ -166,7 +194,7 @@ If you don't install marker, pdf4llm still works — it just won't have the mark
 
 ### 5. pymupdf4llm (last-resort fallback tier)
 
-`pymupdf4llm` is a thin wrapper around PyMuPDF that outputs markdown with basic heading detection. It's the final safety-net tier — runs only after marker-pdf fails — and produces *something* on virtually any text-layer PDF.
+`pymupdf4llm` is a thin wrapper around PyMuPDF that outputs markdown with basic heading detection. It's the final extractor safety-net tier — runs after marker-pdf fails, is unavailable, or is disabled — and produces *something* on virtually any text-layer PDF.
 
 ```bash
 pip install --user pymupdf4llm
@@ -251,7 +279,7 @@ curl -s http://localhost:8070/api/isalive
 pdf4llm convert paper.pdf -o output/
 ```
 
-Runs GROBID and docling in parallel, merges outputs, writes the 6 files listed above.
+Runs GROBID and docling in parallel, merges outputs, and writes the extraction files listed above. `references.md` is conditional; the source PDF is moved only with `--movepdf`.
 
 ### Batch convert a folder
 
@@ -291,15 +319,15 @@ pdf4llm batch ./pdfs/ -o ./output/ --no-marker-fallback
 pdf4llm batch ./pdfs/ -o ./output/ --no-pymupdf-fallback
 ```
 
-By default, pymupdf4llm runs after marker-pdf fails and produces flat markdown as a final safety net. Disable it only if you'd rather have a hard failure (e.g. to surface problem PDFs for manual review) than a best-effort record.
+By default, pymupdf4llm runs when marker-pdf fails, is unavailable, or is disabled and produces flat markdown as a final safety net. Disable it only if you'd rather have a hard failure (e.g. to surface problem PDFs for manual review) than a best-effort record.
 
-### Fast mode (no GROBID, no docling, no OCR)
+### Fast mode (PyMuPDF + pdfplumber)
 
 ```bash
 pdf4llm convert paper.pdf -o output/ --mode fast
 ```
 
-PyMuPDF + pdfplumber only. Very fast (~1–2 s per PDF) but lower quality, especially for references and tables. Useful for quick previews or pre-filtering.
+Starts with PyMuPDF + pdfplumber. Add `--noocr` to disable shared quality-based OCR recovery. Very fast (~1–2 s per PDF) but lower quality, especially for references and tables. Useful for quick previews or pre-filtering.
 
 ### Check GROBID status
 
@@ -313,7 +341,23 @@ pdf4llm health-check
 pdf4llm batch ./pdfs/ -o ./out/ --extract-abstract-only
 ```
 
-Saves just `{stem}_abstract.md` per paper at the top level (no subfolders).
+Saves `{DOI-slug}_abstract.md` (or `{stem}_abstract.md` if no DOI is available) at the top level. Docling-only extraction also saves its full markdown.
+
+### Write one combined Markdown file
+
+```bash
+pdf4llm convert paper.pdf -o output/ --single-markdown
+```
+
+Writes title, abstract, body, and references to `{DOI-slug}.md` (or `{stem}.md`), without the usual subfolder or JSON outputs.
+
+### Extract figure images
+
+```bash
+pdf4llm convert paper.pdf -o output/ --extract-images --images-scale 2
+```
+
+Saves PNG crops from docling’s rendered page regions, including vector figures. No vision model is needed. `--extract-charts` additionally supports vision-model analysis via Ollama.
 
 ---
 
@@ -323,12 +367,12 @@ Saves just `{stem}_abstract.md` per paper at the top level (no subfolders).
 
 | Flag | Description |
 |---|---|
-| `-o, --output PATH` | Output directory (required) |
+| `-o, --output PATH` | Output directory (required for `batch`; defaults to `.` for `convert`) |
 | `--mode [full-grobid\|hybrid\|fast]` | Extraction mode (default: `full-grobid`) |
-| `--workers INT` | Parallel workers (default: `min(10, CPU count)`) |
+| `--workers INT` | Batch only: parallel workers (default: `min(10, CPU count)`) |
 | `--movepdf` | Move source PDFs into output subfolders on success |
-| `--resume` | Skip already-processed PDFs via checkpoint |
-| `--skip-existing` | Skip PDFs whose output files already exist (on by default) |
+| `--resume` | Batch only: skip already-processed PDFs via checkpoint |
+| `--skip-existing` | Batch only: skip PDFs whose output files already exist (on by default) |
 | `-v, --verbose` | Verbose logging |
 
 ### Extractor / merge control
@@ -340,7 +384,9 @@ Saves just `{stem}_abstract.md` per paper at the top level (no subfolders).
 | `--no-parallel` | Disable parallel merge; fall back to classic single-extractor cascade |
 | `--no-marker-fallback` | Disable the marker-pdf fallback tier (runs after GROBID+docling fail) |
 | `--no-pymupdf-fallback` | Disable the pymupdf4llm last-resort fallback tier (runs after marker) |
-| `--docling-gpu` | Enable CUDA for docling (requires GPU + CUDA-enabled PyTorch) |
+| `--no-docling-gpu` | Force docling to CPU |
+| `--gpu-slots INT` | Batch only: concurrent docling GPU workers (default `1`) |
+| `--docling-gpu` | Enable CUDA for docling; batch auto-enables it with ≥2 workers when CUDA is available |
 
 ### GROBID management
 
@@ -351,22 +397,26 @@ Saves just `{stem}_abstract.md` per paper at the top level (no subfolders).
 | `--grobid-home PATH` | Path to GROBID source directory for auto-start |
 | `--run-without-delft` | Allow CRF-only mode when DeLFT is unavailable (lower accuracy) |
 | `--docker` / `--docker-mode [delft\|crf]` | Use Docker-based GROBID |
-| `--timeout INT` | GROBID per-request timeout (default 120 s) |
+| `--timeout INT` | Batch only: GROBID per-request timeout (default 120 s) |
 
 ### OCR / quality
 
 | Flag | Description |
 |---|---|
-| `--noocr` | Disable Tesseract OCR fallback (skip PDFs that fail GROBID extraction) |
-| `--extract-abstract-only` | Extract only the abstract, no body/refs/tables |
+| `--noocr` | Disable pipeline OCR recovery; does not disable docling/marker OCR |
+| `--extract-abstract-only` | Write a flat abstract file; docling-only also writes full markdown |
+| `--no-crossref` | Disable reference DOI enrichment (title API lookup remains enabled) |
 
 ### Output
 
 | Flag | Description |
 |---|---|
-| `--no-json` | Don't write structured JSON files |
-| `--save-tei` | Save raw GROBID TEI XML for debugging |
-| `--checkpoint PATH` | Custom checkpoint file path |
+| `--no-json` | Sets `output_json=False`; the current split-output writer still writes `references.json` and `provenance.json`. Use `--single-markdown` for Markdown-only output. |
+| `--save-tei` | Convert only: save raw GROBID TEI XML for debugging |
+| `--single-markdown` | Write one flat combined Markdown file |
+| `--extract-images` / `--images-scale FLOAT` | Convert only: save docling figure crops; scale defaults to `2.0` |
+| `--extract-charts` / `--chart-model TEXT` / `--ollama-url URL` | Convert only: analyze figures with a vision model |
+| `--checkpoint PATH` | Batch only: custom checkpoint file path |
 
 ---
 
@@ -419,9 +469,9 @@ print(result.generate_report())
 |---|---|---|
 | `full-grobid` (default) | GROBID + docling in parallel, merged; marker fallback; pymupdf4llm last-resort fallback | **Default for production** — best overall quality |
 | `full-grobid --no-parallel` | GROBID → Tesseract OCR fallback → fail | Classic cascade; useful when docling is unavailable |
-| `full-grobid --docling-only` | docling only | No structured references needed, or GROBID is broken |
+| `full-grobid --docling-only` | docling with sparse-text OCR retry and shared recovery | No structured references needed, or GROBID is broken |
 | `hybrid` | Fast extraction (PyMuPDF+pdfplumber) with selective GROBID fallback for deficient fields | Speed-sensitive batches with a quality floor |
-| `fast` | PyMuPDF + pdfplumber only | Quick previews, pre-filtering, or when no GROBID available |
+| `fast` | PyMuPDF + pdfplumber, shared quality OCR unless `--noocr` | Quick previews, pre-filtering, or when no GROBID available |
 
 ---
 
@@ -518,22 +568,18 @@ rm /path/to/output/.pdf4llm_checkpoint.json
 
 ### `docling not found` error
 
-**Cause**: docling isn't installed in the Python that `pdf4llm` uses. Check with `which pdf4llm`; the shebang in that file tells you which Python is being invoked.
+**Cause**: docling is missing from the environment used by pdf4llm. Run `pdf4llm --venv-status` to check the managed and active virtual environments; the launcher may use a different interpreter from its shebang.
 
 **Fix**: Install docling in the same environment:
 ```bash
-# System python with PEP 668 workaround:
-pip install --user --break-system-packages docling
-
-# Or in a venv:
-/path/to/venv/bin/pip install docling
+/path/to/venv/bin/python -m pip install docling
 ```
 
 ### `marker not installed` warning in logs
 
 If you haven't installed marker-pdf, pdf4llm will skip the marker fallback tier with a warning and proceed straight to the pymupdf4llm last-resort tier. This is fine — most PDFs don't need marker. Install if you want the extra coverage:
 ```bash
-pip install --user --break-system-packages marker-pdf
+/path/to/venv/bin/python -m pip install marker-pdf
 ```
 
 ### `pymupdf4llm not available` warning in logs
@@ -603,15 +649,15 @@ merged = DocumentModel(
 )
 ```
 
-`references.md` is extracted from docling's raw markdown output via a heading-detection regex that looks for `# References`, `# Bibliography`, or `# Works Cited`.
+`references.md` is extracted from retained docling, marker, or pymupdf4llm markdown when a references section is found; see [Fallback chain](#fallback-chain).
 
 ---
 
 ## What pdf4llm is not
 
 - **Not a general-purpose PDF converter.** It's optimized for academic papers with a specific output shape that matches downstream LLM-extraction pipelines. For general PDFs (invoices, books, legal documents) you may prefer raw docling or marker-pdf directly.
-- **Not a reference resolver.** It extracts references but doesn't look them up in Crossref/Semantic Scholar. Use a separate resolver for that.
-- **Not a figure extractor by default.** We disable `generate_picture_images` in docling to save disk space. Enable `--extract-charts` if you need it (requires Ollama for vision-model analysis).
+- **Not a full reference resolver.** It can enrich missing reference DOIs through Crossref, but does not guarantee a match for every citation.
+- **Not a figure extractor by default.** We disable `generate_picture_images` in docling to save disk space. Enable `--extract-images` for figure PNGs without a vision model, or `--extract-charts` for vision-model analysis via Ollama.
 
 ---
 
@@ -644,7 +690,7 @@ pdf4llm is distributed under the **GNU Affero General Public License v3 or later
 - `pymupdf`, `pdfplumber` — fast mode
 - `pymupdf4llm` — last-resort fallback tier (wraps `pymupdf`; pulled in as a core dep)
 - `pytesseract`, `Pillow` — OCR fallback
-- `docling` — parallel merge (optional but strongly recommended)
+- `docling` — parallel merge (core dependency)
 - `marker-pdf` — fallback tier after GROBID+docling (optional)
 
 ### System
